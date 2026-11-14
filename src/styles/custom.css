@@ -1,0 +1,39 @@
+/* Head First style boxes. Colours use Starlight tokens so both themes work. */
+.hf-box {
+	margin-block: 1.5rem;
+	padding: 1rem 1.25rem;
+	/* A real border (not a shadow) so the box survives Forced Colors Mode. */
+	border: 2px dashed var(--hf-accent);
+	border-radius: 0.75rem;
+	background: color-mix(in oklab, var(--hf-accent) 8%, transparent);
+}
+.hf-box > :first-child { margin-top: 0; }
+.hf-title {
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	font-size: var(--sl-text-sm);
+	/* -high tokens are Starlight's text-contrast variants; the base hue is for borders. */
+	color: var(--hf-text);
+}
+.hf-brain { --hf-accent: var(--sl-color-purple); --hf-text: var(--sl-color-purple-high); }
+.hf-qa { --hf-accent: var(--sl-color-blue); --hf-text: var(--sl-color-blue-high); }
+.hf-exercise { --hf-accent: var(--sl-color-orange); --hf-text: var(--sl-color-orange-high); }
+.hf-qa dt { font-weight: 600; margin-top: 0.75rem; }
+.hf-qa dt::before { content: 'Q: '; color: var(--hf-text); }
+.hf-qa dd { margin-inline-start: 0; }
+.hf-qa dd::before { content: 'A: '; font-weight: 700; color: var(--hf-text); }
+.hf-exercise details { margin-top: 0.75rem; }
+.hf-exercise summary { cursor: pointer; font-weight: 600; }
+
+/* Diagrams: scale down to the column, never up. */
+.sl-markdown-content svg.d2-svg { max-width: 100%; height: auto; }
+
+/* D2 renders one light theme. In dark mode, invert lightness but keep hues. */
+:root[data-theme='dark'] .sl-markdown-content svg.d2-svg {
+	filter: invert(0.88) hue-rotate(180deg);
+}
+/* Forced Colors Mode repaints SVG fills and strokes with system colours; inverting them would break contrast. */
+@media (forced-colors: active) {
+	:root[data-theme='dark'] .sl-markdown-content svg.d2-svg { filter: none; }
+}

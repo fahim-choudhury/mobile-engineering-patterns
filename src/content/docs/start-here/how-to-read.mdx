@@ -1,0 +1,71 @@
+---
+title: How to read this book
+description: Who this book is for, how chapters are built, and the platform versions it assumes.
+sidebar:
+  order: 1
+---
+
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This book is for engineers who know one mobile stack well and want a working model of the others. You should be comfortable shipping an app on your own platform. You don't need to know any of the other four.
+
+## Every chapter follows the same path
+
+1. **The problem**, in terms any mobile engineer recognises.
+2. **Why mobile makes it hard**: the constraints the OS, the stores or the device impose.
+3. **The pattern**, described without reference to any one stack.
+4. **The pattern in each stack**, as tabs. Pick your stack once and every page remembers it.
+5. **Trade-offs and scale**: what changes with a large app or a large team.
+6. **Sources**, with the versions they apply to.
+
+Code samples are short and idiomatic. They exist to show the shape of a solution, so you can recognise it, review it or ask an agent for it.
+
+## The boxes you will see
+
+<BrainPower>
+A question to think about before you read the next section. Guess first, even if you're wrong. You'll remember the answer better.
+</BrainPower>
+
+<NoDumbQuestions>
+<dt>Do I have to read the chapters in order?</dt>
+<dd>Level 0 first, because later chapters refer to it. After that, jump to whatever problem you have.</dd>
+</NoDumbQuestions>
+
+<Exercise>
+A short task to check you got it. Try it before you open the answer.
+
+<Fragment slot="answer">
+Answers stay collapsed until you ask for them.
+</Fragment>
+</Exercise>
+
+<Aside type="caution" title="Watch it!">
+Mistakes that are easy to make, and outdated advice you'll still find online.
+</Aside>
+
+## Stacks covered
+
+<Tabs syncKey="stack">
+<TabItem label="Android">Kotlin, Jetpack Compose, Jetpack libraries. Views where they still matter.</TabItem>
+<TabItem label="iOS">Swift, SwiftUI, Swift Concurrency. UIKit where it still matters.</TabItem>
+<TabItem label="React Native">TypeScript, the New Architecture, Expo as the default way to build.</TabItem>
+<TabItem label="Flutter">Dart, Flutter's widget framework, the common state and routing packages.</TabItem>
+<TabItem label="KMP / CMP">Kotlin Multiplatform for shared logic, Compose Multiplatform for shared UI.</TabItem>
+</Tabs>
+
+Other stacks (.NET MAUI, Ionic/Capacitor, Lynx and others) appear as short sidebars.
+
+## Version baseline (November 2026)
+
+| Stack | Versions assumed |
+| --- | --- |
+| Android | Android 17 (API 37), Kotlin 2.4 |
+| iOS | iOS 27, Xcode 27, Swift 6 language mode |
+| React Native | React Native 0.88, Expo SDK 57+, Hermes V1 |
+| Flutter | Flutter 3.50, Dart 3.14 |
+| KMP / CMP | Kotlin 2.4 (2.5 in RC), Compose Multiplatform 1.12 |
+
+When a chapter depends on a newer or older version, it says so next to the claim.

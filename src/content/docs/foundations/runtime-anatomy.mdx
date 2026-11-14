@@ -1,0 +1,460 @@
+---
+title: Runtime anatomy
+description: What runs on the phone when you tap the icon of a native, React Native, Flutter or Kotlin Multiplatform app, and why it changes everything else.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+You join a team that ships a Flutter app. A crash report lands in your inbox, and the stack trace has Java frames, C++ frames and Dart frames in it. Which of them is the bug in? You can only answer that if you know which pieces of software are running inside the app and how they talk to each other.
+
+This chapter gives you that picture for every stack in this book. Every later chapter leans on it: state management, navigation, background work and performance all behave the way they do because of the runtime underneath.
+
+<BrainPower>
+Here is "Hello" in four stacks:
+
+- Jetpack Compose: `Text("Hello")`
+- React Native: `<Text>Hello</Text>`
+- Flutter: `Text('Hello')`
+- SwiftUI: `Text("Hello")`
+
+On Android, which of the first three produce an Android `View` object that holds the text? Make a guess before reading on. The answer is at the end of the "Drawing the pixels" section.
+</BrainPower>
+
+## Every app is a native app first
+
+The operating system only knows how to launch one kind of thing: a native app. Android starts an APK's process and creates its `Application` and launcher `Activity`. iOS loads a Mach-O binary and calls its `main` function. Neither OS has heard of React Native, Flutter or Compose Multiplatform.
+
+So every cross-platform app is a real Android app and a real iOS app with a small native shell. The shell's job is to boot a runtime and hand it a surface to draw on. You can see the shell in any project:
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+// Native Android: your Activity is the app.
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { Text("Hello") }
+    }
+}
+```
+</TabItem>
+<TabItem label="iOS">
+```swift
+// Native iOS: SwiftUI's App protocol generates main() for you.
+@main
+struct HelloApp: App {
+    var body: some Scene {
+        WindowGroup { Text("Hello") }
+    }
+}
+```
+</TabItem>
+<TabItem label="React Native">
+```kotlin
+// android/app/.../MainActivity.kt: the native shell.
+class MainActivity : ReactActivity() {
+    override fun getMainComponentName() = "Hello"
+}
+```
+```tsx
+// index.js: what the shell boots. Registered by name.
+import { AppRegistry, Text } from 'react-native';
+
+const App = () => <Text>Hello</Text>;
+AppRegistry.registerComponent('Hello', () => App);
+```
+With Expo Router the entry file is `expo-router/entry` instead, but the shell works the same way.
+</TabItem>
+<TabItem label="Flutter">
+```kotlin
+// android/app/.../MainActivity.kt: the native shell.
+class MainActivity : FlutterActivity()
+```
+```dart
+// lib/main.dart: what the shell boots.
+import 'package:flutter/widgets.dart';
+
+void main() => runApp(
+  const Center(child: Text('Hello', textDirection: TextDirection.ltr)),
+);
+```
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: shared UI, compiled for every target.
+@Composable
+fun App() { Text("Hello") }
+
+// iosMain: wraps the shared UI in a UIKit view controller.
+fun MainViewController() = ComposeUIViewController { App() }
+```
+```swift
+// iosApp (Swift): the native shell hosts the Kotlin view controller.
+struct ComposeView: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> UIViewController {
+        MainViewControllerKt.MainViewController()
+    }
+    func updateUIViewController(_ vc: UIViewController, context: Context) {}
+}
+```
+On Android, CMP is plain Jetpack Compose inside a normal `ComponentActivity`.
+</TabItem>
+</Tabs>
+
+That shell is where you, the native developer, come back in. Push tokens, deep links, permissions and app lifecycle events all arrive at the native shell first. Cross-platform frameworks forward them to your shared code, and when the forwarding has a gap, someone writes Kotlin or Swift to fill it.
+
+## The five stacks, layer by layer
+
+Each stack answers the same questions differently: what language you write, what it compiles to, what executes it and who turns UI descriptions into pixels.
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  runtime: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  box: { style: { font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  group: { style: { font-size: 18 } }
+}
+grid-rows: 5
+grid-columns: 5
+grid-gap: 12
+h0: "Native Android" { class: head }
+h1: "Native iOS" { class: head }
+h2: "React Native" { class: head }
+h3: "Flutter" { class: head }
+h4: "KMP + CMP" { class: head }
+r1c0: "Kotlin" { class: code; width: 140; height: 64 }
+r1c1: "Swift" { class: code; width: 140; height: 64 }
+r1c2: "TypeScript\n+ React" { class: code; width: 140; height: 64 }
+r1c3: "Dart" { class: code; width: 140; height: 64 }
+r1c4: "Kotlin" { class: code; width: 140; height: 64 }
+r2c0: "DEX bytecode\non ART" { class: runtime; width: 140; height: 64 }
+r2c1: "Machine code\n(AOT)" { class: runtime; width: 140; height: 64 }
+r2c2: "Hermes VM" { class: runtime; width: 140; height: 64 }
+r2c3: "Machine code\n+ engine" { class: runtime; width: 140; height: 64 }
+r2c4: "ART / Kotlin\nNative" { class: runtime; width: 140; height: 64 }
+r3c0: "Jetpack\nCompose" { class: ui; width: 140; height: 64 }
+r3c1: "SwiftUI /\nUIKit" { class: ui; width: 140; height: 64 }
+r3c2: "Fabric ->\nnative views" { class: ui; width: 140; height: 64 }
+r3c3: "Impeller\npaints widgets" { class: ui; width: 140; height: 64 }
+r3c4: "Compose\n(Skia on iOS)" { class: ui; width: 140; height: 64 }
+r4c0: "Android" { class: os; width: 140; height: 64 }
+r4c1: "iOS" { class: os; width: 140; height: 64 }
+r4c2: "Native shell" { class: os; width: 140; height: 64 }
+r4c3: "Native shell" { class: os; width: 140; height: 64 }
+r4c4: "Native shell" { class: os; width: 140; height: 64 }
+```
+
+Yellow is the code you write, blue is what runs it, green is what produces the UI, grey is what the OS launches.
+
+### Native Android
+
+Kotlin compiles to DEX bytecode. Android Runtime (ART) runs it with a mix of interpretation, JIT and ahead-of-time compilation guided by profiles. Baseline Profiles let you ship a list of hot code paths so ART can compile them at install time, which is why they help startup.
+
+Every app process is forked from **Zygote**, a process that starts at boot with the framework classes and resources already loaded. The fork shares those memory pages copy-on-write, so a new app does not pay to load the framework again ([Android docs: memory overview](https://developer.android.com/topic/performance/memory-overview)).
+
+Your UI code runs on the **main thread**, a `Looper` that processes one message at a time: input events, lifecycle callbacks, frame callbacks from `Choreographer`. Block it for five seconds during input handling and you get an ANR.
+
+### Native iOS
+
+Swift compiles straight to ARM machine code. There is no VM and no garbage collector. Memory is managed with Automatic Reference Counting (ARC), where the compiler inserts retain and release calls. Reference cycles leak, which is why you see `[weak self]` all over iOS code.
+
+At launch the system loads your binary and its frameworks, then `UIApplicationMain` creates the application object and starts the **main run loop** ([Apple: About the app launch sequence](https://developer.apple.com/documentation/uikit/app_and_environment/responding_to_the_launch_of_your_app/about_the_app_launch_sequence)). With SwiftUI's `@main App` you never see this call, but it still happens. UIKit apps built with the iOS 27 SDK must use the scene-based lifecycle (`UISceneDelegate`) or they will not launch ([TN3187](https://developer.apple.com/documentation/technotes/tn3187-migrating-to-the-uikit-scene-based-life-cycle)).
+
+The main thread is the only thread allowed to touch UI. Swift Concurrency encodes that rule in the type system as `@MainActor`, so the compiler rejects UI updates from a background task.
+
+### React Native
+
+A React Native app ships a JavaScript bundle. In release builds the bundle is compiled to **Hermes bytecode** at build time, so the phone skips parsing JavaScript source on startup. Hermes V1 is the default engine since React Native 0.84 ([release post](https://reactnative.dev/blog/2026/02/11/react-native-0.84)).
+
+Since 0.82 the **New Architecture** is the only architecture ([release post](https://reactnative.dev/blog/2025/10/08/react-native-0.82)). You will still find blog posts about "the bridge", an asynchronous queue of JSON messages between JavaScript and native. That design is gone. Its replacements:
+
+- **JSI** (JavaScript Interface): a C++ API that lets JavaScript hold references to C++ objects and call them directly, including synchronously.
+- **Fabric**: the renderer. It turns your React tree into real platform views.
+- **Turbo Native Modules**: native modules exposed through JSI, with typed interfaces generated by Codegen.
+
+Fabric works in three phases ([docs: render pipeline](https://reactnative.dev/architecture/render-pipeline)). In **render**, React runs your components on the JavaScript thread and the renderer builds a C++ "shadow tree". In **commit**, Yoga computes layout (Flexbox) for that tree. In **mount**, the UI thread creates or updates real `android.view.View` and `UIView` objects to match.
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  runtime: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  box: { style: { font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  group: { style: { font-size: 18 } }
+}
+direction: down
+js: "JavaScript thread" {
+  class: group
+  grid-columns: 3
+  horizontal-gap: 40
+  render: "Render:\nReact runs\ncomponents" { class: box }
+  stree: "C++\nshadow tree" { class: box }
+  layout: "Commit:\nYoga layout" { class: box }
+  render -> stree -> layout
+}
+ui: "UI (main) thread" {
+  class: group
+  grid-columns: 2
+  horizontal-gap: 40
+  mount: "Mount:\ncreate/update\nhost views" { class: box }
+  views: "android.view.View\nor UIView" { class: box; shape: page }
+  mount -> views
+}
+js -> ui: "next tree" { style.font-size: 14 }
+```
+
+Your business logic runs on the JavaScript thread. If it is busy for 200 ms, JavaScript-driven animations and touch feedback freeze for 200 ms, even though the UI thread is free ([docs: performance](https://reactnative.dev/docs/performance)).
+
+### Flutter
+
+Dart code is compiled to machine code ahead of time (AOT) for release builds. Debug builds run on the Dart VM with a JIT compiler, which is what makes stateful hot reload possible.
+
+The native shell (`FlutterActivity`, `FlutterViewController`) is the **embedder**. It starts the Flutter engine, a C++ library, and gives it a surface to draw into ([Flutter architectural overview](https://docs.flutter.dev/resources/architectural-overview)). From then on Flutter owns every pixel on that surface. A Flutter button is not a `android.widget.Button` or a `UIButton`. It is shapes and text that Flutter paints.
+
+Painting goes through **Impeller**, Flutter's renderer, which precompiles its shaders at build time so animations do not stutter on first run. Impeller is the default on iOS and on Android API 29+ with Vulkan, with an OpenGL fallback on older devices ([docs: Impeller](https://docs.flutter.dev/perf/impeller)).
+
+Threads changed recently. Flutter used to run Dart on its own UI thread, separate from the platform's main thread. Since Flutter 3.29, Dart runs **on the platform main thread** on iOS and Android ([breaking-change note](https://docs.flutter.dev/release/breaking-changes/macos-windows-merged-threads)). That makes synchronous calls into native APIs possible, and it means a slow Dart function now blocks the same thread Android watches for ANRs. Heavy work belongs in an **isolate**, Dart's unit of concurrency with its own memory heap.
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  runtime: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  box: { style: { font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  group: { style: { font-size: 18 } }
+}
+direction: down
+iso: "Background isolate (own thread, own heap)" {
+  class: group
+  style.stroke-dash: 4
+  work: "JSON parsing,\nimage processing" { class: box }
+}
+main: "Platform main thread" {
+  class: group
+  grid-columns: 2
+  horizontal-gap: 40
+  dart: "Dart: build,\nlayout, paint" { class: box }
+  tree: "Layer tree" { class: box }
+  dart -> tree
+}
+iso -> main: "messages" { style.font-size: 14; style.stroke-dash: 4 }
+raster: "Raster thread" {
+  class: group
+  grid-columns: 2
+  horizontal-gap: 40
+  imp: "Impeller" { class: box }
+  gpu: "GPU\nMetal / Vulkan / GL" { class: box; shape: cylinder }
+  imp -> gpu
+}
+main -> raster: "each frame" { style.font-size: 14 }
+```
+
+### Kotlin Multiplatform and Compose Multiplatform
+
+Kotlin Multiplatform (KMP) is not a runtime. It is a compiler setup that builds the same Kotlin source for several targets:
+
+- On Android, Kotlin compiles to JVM bytecode and runs on ART like any Android code. There is no extra runtime.
+- On iOS, **Kotlin/Native** compiles Kotlin to machine code through LLVM and packages it as an Apple framework. That framework carries a small runtime with its own tracing garbage collector, which cooperates with Swift's ARC at the boundary.
+
+Swift sees Kotlin through Objective-C headers today, which is why some Kotlin APIs look clumsy from Swift (sealed classes, generics, default arguments). **Swift export**, which generates Swift APIs directly, is in Beta as of Kotlin 2.5.0-RC ([Kotlin 2.5.0-RC notes](https://kotlinlang.org/docs/whatsnew-eap.html)).
+
+KMP on its own shares logic: networking, storage, business rules. Each platform keeps its own UI. **Compose Multiplatform** (CMP) adds shared UI. On Android it is Jetpack Compose. On iOS it renders with Skia into a Metal-backed view hosted by a `UIViewController`, so it draws its own pixels the way Flutter does. CMP for iOS is stable since 1.8.0 (May 2025) ([JetBrains blog](https://blog.jetbrains.com/kotlin/2025/05/compose-multiplatform-1-8-0-released-compose-multiplatform-for-ios-is-stable-and-production-ready/)), and rendering runs on a separate render thread by default since 1.11.
+
+<Aside type="note" title="If you only know Android">
+KMP is the stack where your existing knowledge transfers most directly. Coroutines, Flow, Ktor, Room (which supports KMP) and Compose all work in shared code. The new parts are Kotlin/Native's memory and threading rules on iOS, Xcode builds and the Swift-facing API of your module.
+</Aside>
+
+## Drawing the pixels
+
+The biggest difference between the stacks is who owns the UI components.
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  runtime: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  box: { style: { font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  group: { style: { font-size: 18 } }
+}
+grid-columns: 3
+grid-gap: 24
+p: "Platform owns\nthe components" {
+  class: group
+  ex: "UIKit, SwiftUI,\nAndroid Views,\nReact Native" { class: box }
+}
+f: "Framework owns\ncomponents, platform\ngraphics draw them" {
+  class: group
+  ex: "Jetpack Compose\non Android" { class: box }
+}
+o: "Framework owns\ncomponents and\nthe renderer" {
+  class: group
+  ex: "Flutter,\nCompose MP\non iOS" { class: box }
+}
+```
+
+**Platform-owned components.** SwiftUI and UIKit draw Apple's controls. React Native's `<Text>` becomes a real text view on each platform, and libraries like `react-native-screens` use the platform's own navigation containers. When Apple restyles its controls, as it did with Liquid Glass in iOS 26, native apps pick up much of the new look when rebuilt with the new SDK. React Native apps get it wherever they use platform containers and controls.
+
+**Framework-owned components, platform graphics.** Jetpack Compose does not create a `TextView` for each `Text`. A single `AndroidComposeView` hosts the whole composition, and Compose draws text and shapes itself through Android's hardware-accelerated graphics pipeline. It still uses the platform's text rendering, accessibility services and input system.
+
+**Framework-owned components and renderer.** Flutter and CMP on iOS paint everything with their own engine. You get identical pixels on every device and full control over every frame. In exchange, the framework has to reimplement platform behaviour: text selection handles, scroll physics, accessibility trees, keyboard handling and new design languages. Flutter's Cupertino widgets do not change when iOS changes. CMP 1.11 added an opt-in native `UIView`-based text input on iOS for exactly this reason ([CMP 1.11 notes](https://kotlinlang.org/docs/multiplatform/whats-new-compose-111.html)).
+
+Answer to the Brain Power question: only **React Native** produces an Android `View` holding the text. Compose draws the text inside one host view, and Flutter paints it onto its surface.
+
+| Consequence | Platform-owned (native, RN) | Self-rendered (Flutter, CMP iOS) |
+| --- | --- | --- |
+| Looks native by default | Yes | Only as far as the widget set imitates it |
+| Gets new OS design automatically | Mostly | No, waits for framework updates |
+| Same pixels on both platforms | No | Yes |
+| Embedding a native map or WebView | Trivial | Possible through platform views, with a performance cost |
+| Accessibility | Comes from the platform | Framework builds a semantics tree and translates it |
+
+## Calling into the platform
+
+Sooner or later shared code needs something only the OS has: the camera, biometrics, Keychain, a vendor SDK. How each stack crosses that boundary shapes its plugin ecosystem and its performance.
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  runtime: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  box: { style: { font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  group: { style: { font-size: 18 } }
+}
+grid-rows: 3
+grid-gap: 24
+rn: "React Native" {
+  class: group
+  grid-columns: 3
+  horizontal-gap: 50
+  js: "TypeScript" { class: code }
+  jsi: "JSI (C++)\nTurbo Module" { class: runtime }
+  n: "Kotlin / Swift" { class: os }
+  js -> jsi -> n
+}
+fl: "Flutter" {
+  class: group
+  grid-rows: 2
+  grid-columns: 3
+  vertical-gap: 30
+  horizontal-gap: 50
+  dart: "Dart" { class: code }
+  ch: "Platform\nchannel" { class: runtime }
+  n: "Kotlin / Swift" { class: os }
+  dart2: "Dart" { class: code }
+  ffi: "FFI\nbindings" { class: runtime }
+  n2: "Swift / C / JNI" { class: os }
+  dart -> ch -> n
+  dart2 -> ffi -> n2
+}
+kmp: "KMP" {
+  class: group
+  grid-rows: 2
+  grid-columns: 3
+  vertical-gap: 30
+  horizontal-gap: 50
+  c1: "expect fun" { class: code }
+  ios: "iosMain:\nactual fun" { class: runtime }
+  u: "UIKit,\nFoundation" { class: os }
+  c2: "expect fun" { class: code }
+  and: "androidMain:\nactual fun" { class: runtime }
+  a: "Android SDK" { class: os }
+  c1 -> ios -> u
+  c2 -> and -> a
+}
+```
+
+- **React Native**: native code is exposed as Turbo Native Modules (logic) or Fabric native components (views). You declare a typed spec in TypeScript and Codegen produces the C++ and native glue. Expo Modules offer a Swift and Kotlin API on top of the same machinery.
+- **Flutter**: the long-standing route is **platform channels**, which serialize messages between Dart and native code asynchronously. **Pigeon** generates type-safe channel code. Since Flutter 3.50, direct native interop through FFI with generated bindings (`ffigen` for Objective-C and Swift, `jnigen` for Java and Kotlin) is stable ([Flutter 3.50 announcement](https://flutter.dev/blog/whats-new-in-flutter-3-50)).
+- **KMP**: there is no bridge to cross. `expect` declarations in common code get `actual` implementations per platform, and those implementations call platform APIs directly. iOS code in Kotlin can import `platform.UIKit` and `platform.Foundation`, because Kotlin/Native generates bindings for Apple's Objective-C frameworks.
+
+## Consequences for the rest of the book
+
+Knowing the runtime predicts a lot of behaviour you would otherwise learn the hard way.
+
+**Startup.** A native app starts its process and draws. A cross-platform app also has to load its runtime: the Hermes VM and bundle, or the Flutter engine and Dart snapshot. Frameworks work hard to hide this, but it shows up in cold start traces and is why "time to first frame" is a standard metric for these stacks.
+
+**App size.** Every engine ships inside your app. Flutter carries its engine and Impeller, React Native carries Hermes and its C++ core, and CMP on iOS carries Skia and the Kotlin/Native runtime.
+
+**Crashes and debugging.** Release builds strip names. A React Native crash needs JavaScript source maps, Flutter needs the Dart symbol files from `--split-debug-info`, and Kotlin/Native needs the dSYM generated for its framework. Stack traces mix languages, as in the opening example.
+
+**Shipping fixes.** A JavaScript bundle is data the app loads, so React Native apps can replace it over the air (Expo Updates is the common tool) within the app store rules. Native code always needs a store release. The release chapter covers the details.
+
+**Threading bugs.** Each stack has a "never block this thread" rule, but the thread differs. React Native has two to watch, the JavaScript thread and the UI thread. Flutter now has one, the platform main thread, plus isolates for heavy work.
+
+<NoDumbQuestions>
+<dt>Is React Native "native" then?</dt>
+<dd>Its UI is: the views on screen are platform views. Its logic is not: your code runs as JavaScript in Hermes. That is why it feels native for standard screens and why heavy JavaScript work can still cause jank.</dd>
+
+<dt>Is Compose Multiplatform on iOS just Flutter written in Kotlin?</dt>
+<dd>On iOS the rendering approach is similar, since both draw with their own engine. The difference is everything around the UI: CMP compiles to native code that calls Apple frameworks directly, with no message channel, and it shares its UI API with Jetpack Compose on Android.</dd>
+
+<dt>Does KMP replace Swift on iOS?</dt>
+<dd>No. A typical KMP app shares data and domain layers and keeps SwiftUI on iOS. With CMP you can share UI too, but the app entry point, Xcode project and platform integrations remain Swift.</dd>
+
+<dt>Can I still find the old React Native "bridge" in my app?</dt>
+<dd>Not on 0.82 or later. Older libraries written for the bridge run through an interop layer, and remaining Legacy Architecture code is being removed release by release.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+Use this when you read docs for a stack you don't know.
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Entry point | `Application`, `Activity` | `@main App` or `UIApplicationDelegate` + `UISceneDelegate` | `ReactActivity` / `AppDelegate` booting `AppRegistry` | `FlutterActivity` / `FlutterViewController` calling `main()` | Native shells, shared `App()` composable |
+| Language | Kotlin | Swift | TypeScript | Dart | Kotlin |
+| Runs on | ART | Native code | Hermes VM | Native code + Flutter engine | ART (Android), native code (iOS) |
+| Memory | Tracing GC | ARC | Hermes GC | Dart GC | ART GC / Kotlin/Native GC with ARC interop |
+| UI toolkit | Compose (Views) | SwiftUI (UIKit) | React components -> native views | Widgets painted by Impeller | Compose, Skia on iOS |
+| Thread to protect | Main thread | Main thread (`@MainActor`) | JS thread and UI thread | Platform main thread | Same as host platform |
+| Reach native APIs | Directly | Directly | Turbo Native Modules, Expo Modules | Platform channels, Pigeon, FFI | `expect`/`actual`, direct calls |
+| Hot reload | Compose Live Edit (limited) | Xcode Previews | Fast Refresh | Stateful hot reload (JIT in debug) | Compose Hot Reload (desktop target) |
+
+<Exercise>
+Each line below is a frame from a real-world crash report. Name the stack, and say which layer the frame belongs to (your code, runtime, UI framework or native shell).
+
+1. `android.os.Looper.loop`
+2. `io.flutter.embedding.engine.FlutterJNI.dispatchPlatformMessage`
+3. `facebook::react::...` / `hermes::vm::...`
+4. `kfun:com.example.checkout.CartRepository#total(){}kotlin.Double`
+5. `UIApplicationMain`
+
+<Fragment slot="answer">
+1. Any Android app, since all of them run on the main `Looper`. Native shell / OS layer.
+2. Flutter on Android. The engine's JNI layer delivering a platform channel message, so a native call is involved.
+3. React Native. The C++ core and the Hermes VM. Look further down the trace for the JavaScript frame, which needs a source map to read.
+4. Kotlin/Native on iOS. `kfun:` is how Kotlin/Native names compiled Kotlin functions. This is your shared code.
+5. Any iOS app, including RN, Flutter and CMP ones. The UIKit entry point that runs the main run loop.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks you will meet
+
+- **.NET MAUI**: C# on the .NET runtime. UI controls are mapped to platform controls through "handlers", so it sits with React Native in the platform-owned group.
+- **Ionic / Capacitor**: a web app running in the platform WebView, with a plugin bridge to native APIs. The rendering is the browser engine's.
+- **Lynx** (ByteDance): JavaScript UI framework that renders native views, with a dual-thread design that keeps the main thread free of app logic.
+
+## Sources
+
+- Android: [Memory overview (Zygote)](https://developer.android.com/topic/performance/memory-overview), [Processes and app lifecycle](https://developer.android.com/guide/components/activities/process-lifecycle), [Baseline Profiles](https://developer.android.com/topic/performance/baselineprofiles/overview)
+- iOS: [About the app launch sequence](https://developer.apple.com/documentation/uikit/app_and_environment/responding_to_the_launch_of_your_app/about_the_app_launch_sequence), [TN3187: scene-based life cycle](https://developer.apple.com/documentation/technotes/tn3187-migrating-to-the-uikit-scene-based-life-cycle)
+- React Native: [Render, commit and mount](https://reactnative.dev/architecture/render-pipeline), [Threading model](https://reactnative.dev/architecture/threading-model), [0.82: New Architecture only](https://reactnative.dev/blog/2025/10/08/react-native-0.82), [0.84: Hermes V1 by default](https://reactnative.dev/blog/2026/02/11/react-native-0.84)
+- Flutter: [Architectural overview](https://docs.flutter.dev/resources/architectural-overview), [Impeller](https://docs.flutter.dev/perf/impeller), [Merged threads](https://docs.flutter.dev/release/breaking-changes/macos-windows-merged-threads), [Flutter 3.50](https://flutter.dev/blog/whats-new-in-flutter-3-50)
+- Kotlin: [Swift/Objective-C interop](https://kotlinlang.org/docs/native-objc-interop.html), [Swift export](https://kotlinlang.org/docs/native-swift-export.html), [CMP 1.8.0 iOS stable](https://blog.jetbrains.com/kotlin/2025/05/compose-multiplatform-1-8-0-released-compose-multiplatform-for-ios-is-stable-and-production-ready/), [CMP 1.11](https://kotlinlang.org/docs/multiplatform/whats-new-compose-111.html)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, Part 4 (cross-platform approaches)

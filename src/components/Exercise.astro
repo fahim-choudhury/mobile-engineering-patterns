@@ -1,0 +1,13 @@
+---
+// Hands-on exercise. Put the answer in the "answer" slot; it renders collapsed.
+interface Props { title?: string }
+const { title = 'Sharpen your pencil' } = Astro.props;
+---
+<aside class="hf-box hf-exercise" aria-label={title}>
+	<p class="hf-title">{title}</p>
+	<slot />
+	<details>
+		<summary>Show answer</summary>
+		<slot name="answer" />
+	</details>
+</aside>
