@@ -1,0 +1,241 @@
+---
+title: Choosing a cross-platform strategy
+description: How to decide how much code two mobile apps should share, which stack fits that decision, and how to adopt it inside an app that already exists.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A company has an Android app and an iOS app, six engineers on each. The reports from one quarter:
+
+- A feature ships on iOS three weeks before Android, and support answers "when is it coming to my phone?" every day.
+- The two apps round a discount differently, so the same cart costs one cent more on Android.
+- The CTO reads a conference talk and asks why the company pays for everything twice.
+- An engineer proposes a rewrite in the stack they used at their last job. The estimate is four months. Nobody can say what happens to the roadmap in those four months.
+
+Every option here has a company that chose it and wrote about the result, and for every option another company wrote about leaving it. The decision depends on your app, your team and the year you make it in.
+
+<BrainPower>
+Take the last five features your team shipped. For each one, how much of the work was screens, how much was rules and data, and how much was platform integration such as push, widgets or payments? Which of the three would you least like to write twice?
+</BrainPower>
+
+## Constraints on a phone
+
+- **The two platforms differ below the UI.** Process death, background limits, permissions, purchases and store rules are different systems on Android and iOS ([app lifecycle](/foundations/app-lifecycle/), [background work](/core-patterns/background-work/), [in-app purchases](/shipping/in-app-purchases/)). A shared codebase still has to handle both.
+- **The platforms change every year.** Each autumn brings a new OS, a new SDK requirement from the stores and sometimes a new design language ([old app versions](/shipping/old-versions/)). A layer between your code and the platform has to catch up before you can.
+- **Each layer has its own release cycle.** React Native, Flutter and Kotlin each ship several releases a year. Upgrading them is work a two-app native team does not have, in exchange for the work it saves.
+- **Your team already knows something.** Twelve engineers who know Kotlin and Swift are a different starting point from twelve who know React.
+- **The app already exists.** A new stack usually enters an app with years of code in it, and has to live beside that code for a long time.
+- **Apps outlive decisions.** The stack you pick will be maintained by people who were not in the meeting.
+
+## The pattern
+
+Decide how much to share first. The stack follows from that.
+
+```d2
+classes: {
+  none: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  logic: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  web: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 3
+grid-columns: 4
+grid-gap: 8
+h1: "Share nothing" { class: head }
+h2: "Share logic" { class: head }
+h3: "Share logic\nand UI" { class: head }
+h4: "Share a\nweb app" { class: head }
+a1: "Two native apps,\none API contract,\none design spec" { class: none }
+a2: "Shared module\nfor data and rules,\nnative UI" { class: logic }
+a3: "One codebase,\nnative shell\nper platform" { class: ui }
+a4: "Web code in the\nplatform WebView" { class: web }
+b1: "Kotlin + Swift" { class: none }
+b2: "Kotlin\nMultiplatform" { class: logic }
+b3: "React Native,\nFlutter, CMP" { class: ui }
+b4: "Capacitor" { class: web }
+```
+
+1. **List the work that is expensive to write twice in your app.** A banking app has a lot of validation and calculation. A camera app has almost none, and most of its code talks to platform APIs.
+2. **Choose a level of sharing.** Sharing rules and data removes the one-cent bug and keeps each platform's UI. Sharing UI as well removes the three-week gap and puts a rendering layer between you and the platform ([runtime anatomy](/foundations/runtime-anatomy/#drawing-the-pixels)).
+3. **Pick the stack your team can staff.** Among stacks at the same level, the language your engineers know and the people you can hire decide more than benchmarks do.
+4. **Prototype the hardest screen.** A list of text rows works in every stack. Build the screen with the camera, the map, the payment sheet or the long animated feed, on a slow Android phone.
+5. **Adopt it inside the existing app.** Add the new stack as one screen or one module of the shipped app. A rewrite on a branch delivers nothing until the day it replaces everything.
+6. **Write down the exit.** Record which parts would have to be rewritten if the stack were dropped, and review the decision when a core assumption changes.
+
+## The stacks at each level
+
+| | Native twice | KMP | CMP | React Native | Flutter |
+| --- | --- | --- | --- | --- | --- |
+| Shared by default | Nothing | Data and domain layers | Data, domain and UI | UI and logic | UI and logic |
+| Language | Kotlin and Swift | Kotlin, plus Swift for iOS UI | Kotlin | TypeScript | Dart |
+| UI on screen | Platform toolkits | Platform toolkits | Compose, drawn by Skia on iOS | Platform views | Flutter's own renderer |
+| Platform APIs | Direct | Direct from Kotlin | Direct from Kotlin | Through native modules | Through channels or generated bindings |
+| Fix without a store release | No | No | No | JavaScript, with Expo Update | Dart, with Shorebird (third party) |
+| Maintained by | Google, Apple | JetBrains, supported by Google | JetBrains | Meta, with Expo as the recommended framework | Google |
+
+Kotlin Multiplatform has been stable since Kotlin 1.9.20 in November 2023 ([JetBrains announcement](https://blog.jetbrains.com/kotlin/2023/11/kotlin-multiplatform-stable/)), and Google supports it for sharing business logic between Android and iOS ([Android: Kotlin Multiplatform](https://developer.android.com/kotlin/multiplatform)). Compose Multiplatform for iOS has been stable since 1.8.0 in May 2025 ([release post](https://blog.jetbrains.com/kotlin/2025/05/compose-multiplatform-1-8-0-released-compose-multiplatform-for-ios-is-stable-and-production-ready/)). React Native's documentation recommends starting new apps with a framework and names Expo ([React Native: get started](https://reactnative.dev/docs/environment-setup)). The [native interop](/architecture/native-interop/) chapter covers the "platform APIs" row in detail.
+
+## Adding each stack to an existing app
+
+The samples add one screen or one module to an app that is already in the stores.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+Staying native on both platforms is a strategy too. The sharing moves from code to specifications:
+
+| Shared artifact | Effect |
+| --- | --- |
+| One API schema (OpenAPI, GraphQL or protobuf) with generated clients | Both apps parse the same fields the same way |
+| Rules computed by the backend | The discount is rounded once, on the server |
+| Design tokens exported from the design tool | Colours and spacing match without a shared UI layer |
+| One written spec and one set of acceptance tests per feature | Both teams build the same behaviour |
+| [Server-driven UI](/architecture/server-driven-ui/) for screens that change weekly | Layout changes ship to both platforms at once |
+
+From an Android team's seat, Kotlin Multiplatform is the smallest step away from this. The shared module is a Gradle module written in the language you already use, and the Android app does not change its UI or its build.
+</TabItem>
+<TabItem label="iOS">
+The table in the Android tab applies unchanged. Two native apps share a schema, server-side rules, design tokens and specs.
+
+From an iOS team's seat, the direction of sharing can also be reversed. Swift 6.3 includes the first official Swift SDK for Android, so Swift packages with models and rules can be compiled for Android and called from Kotlin through JNI ([Swift 6.3 released](https://www.swift.org/blog/swift-6.3-released/)). The SDK is new, and the tooling around it is younger than Kotlin Multiplatform's. Treat it as an option for a team whose shared code already exists in Swift.
+
+A Kotlin Multiplatform module arrives in Xcode as a framework, and the SwiftUI code stays yours. The KMP tab shows the call.
+</TabItem>
+<TabItem label="React Native">
+```sh
+# In the Expo project that holds the React Native screens
+npx expo install expo-brownfield
+npx expo-brownfield build:android        # AAR, published to a Maven repository
+npx expo-brownfield build:ios --release --package ShopScreens   # XCFrameworks as a Swift package
+```
+Expo documents two ways into an existing app. The isolated approach, added in SDK 55, builds the React Native code as an AAR and an XCFramework, and the native app consumes them like any other library. Native engineers need no Node.js toolchain. The integrated approach puts React Native inside the native project and builds everything together ([Expo: isolated approach](https://docs.expo.dev/brownfield/isolated-approach/), [Expo brownfield announcement](https://expo.dev/blog/expo-brownfield-how-to-add-expo-to-your-existing-native-app-without-a-rewrite)). React Native's own guide covers the same integration without Expo ([integration with existing apps](https://reactnative.dev/docs/integration-with-existing-apps)).
+</TabItem>
+<TabItem label="Flutter">
+```kotlin
+// Android host: open a Flutter screen from an existing Activity
+startActivity(FlutterActivity.createDefaultIntent(this))
+```
+```swift
+// iOS host: present a Flutter screen with an engine started at launch
+let flutterVC = FlutterViewController(engine: flutterEngine, nibName: nil, bundle: nil)
+present(flutterVC, animated: true)
+```
+Flutter calls this add-to-app. The Flutter code is a module that the native app imports, and it renders one screen or one view while the rest stays native ([add Flutter to an existing app](https://docs.flutter.dev/add-to-app)). Several Flutter instances can run in one app, each with its own navigation stack and state, at a documented memory cost of about 180 kB per extra instance ([multiple Flutter screens or views](https://docs.flutter.dev/add-to-app/multiple-flutters)). The first Flutter engine costs more than that in memory and startup time, so start it before the user opens the screen.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// shared/src/commonMain: one implementation of the rule both apps got wrong
+class DiscountCalculator {
+    fun apply(priceCents: Long, percent: Int): Long =
+        priceCents - (priceCents * percent + 50) / 100
+}
+```
+```swift
+// iOS app: the module is imported like any framework
+import Shared
+
+let total = DiscountCalculator().apply(priceCents: 1999, percent: 15)
+```
+A KMP module can start with one class. The Android app depends on it as a Gradle module, and the iOS app links the framework Gradle builds from it ([project configuration](https://kotlinlang.org/docs/multiplatform/multiplatform-project-configuration.html)). Nothing else in either app changes. Compose Multiplatform can later take over single screens inside the SwiftUI app through `ComposeUIViewController` ([SwiftUI integration](https://kotlinlang.org/docs/multiplatform/compose-swiftui-integration.html)).
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+An app that is half migrated has three platforms: Android, iOS and the new stack, plus the glue between them. Navigation, analytics, theming and login state must work across the boundary. Airbnb listed this cost among its reasons for leaving React Native in 2018 ([Sunsetting React Native](https://medium.com/airbnb-engineering/sunsetting-react-native-1868ba28e30a)). Set a date by which a mixed app is either mostly migrated or back to native.
+</Aside>
+
+## Decisions companies published
+
+| Company | Decision | Stated reason |
+| --- | --- | --- |
+| Airbnb, 2018 | Left React Native after two years in a mixed app | Technical and organizational cost of maintaining native and React Native side by side ([post](https://medium.com/airbnb-engineering/sunsetting-react-native-1868ba28e30a)) |
+| Dropbox, 2019 | Stopped sharing C++ between iOS and Android | The custom tooling, the non-standard code and the hiring difficulty cost more than writing the code twice ([post](https://dropbox.tech/mobile/the-not-so-hidden-cost-of-sharing-code-between-ios-and-android)) |
+| Nubank | Flutter, with a server-driven UI layer on top | One team per product instead of one per platform ([post](https://building.nu.com/server-driven-ui-framework-at-nubank/)) |
+| Google Workspace, 2024 | Kotlin Multiplatform for shared business logic, starting with Google Docs | One implementation across Android, iOS and web ([Android Developers Blog](https://android-developers.googleblog.com/2024/05/android-support-for-kotlin-multiplatform-to-share-business-logic-across-mobile-web-server-desktop.html)) |
+| Shopify, 2020 to 2025 | Moved every app to React Native, then to its New Architecture | Build features once, move engineers between platforms ([migration post](https://shopify.engineering/react-native-new-architecture)) |
+| Shopify, September 2026 | Moving every app back to Swift and Kotlin | Coding agents lowered the cost of building a feature twice, while the benefits of building directly on each platform remained ([post](https://shopify.engineering/back-to-native)) |
+
+Shopify's two decisions used the same reasoning six years apart. In 2020 the cost of writing everything twice was the deciding factor. In 2026 the company measured that cost again with coding agents doing much of the implementation, and it had dropped. The same post calls React Native "an excellent framework" and says the React Native apps were fast. The inputs changed, and the answer changed with them.
+
+## Trade-offs and scale
+
+**The shared part needs owners.** Shared code that everyone may edit and nobody maintains turns into the slowest part of the build and the place where upgrades stall. Give it a team, or a rotation, with time for upgrades.
+
+**Platform features on day one.** A new OS feature is available to Swift and Kotlin code the day the beta ships. In a shared-UI stack you wait for the framework or a library to wrap it, or you write the wrapper yourself. If your product competes on new platform features, weigh this heavily.
+
+**UI fidelity.** React Native renders platform views, so most platform restyling arrives with a rebuild. Flutter and Compose Multiplatform on iOS draw their own pixels and reproduce platform looks in framework code, which follows the platform with a delay ([UI ownership](/foundations/runtime-anatomy/#drawing-the-pixels)). A strongly branded app is affected less than one that aims to look like a system app.
+
+**Release speed.** Replacing JavaScript or Dart over the air shortens the time to fix a bug from days to an hour for that layer ([releases](/shipping/releases/)). For a team that ships content-heavy screens weekly this can matter more than any other row in the table.
+
+**Hiring and mobility.** One UI stack lets an engineer build a whole feature. It also narrows hiring to people who know that stack or will learn it, and it still needs engineers who understand each platform, because the native shell, the build and the store work do not go away.
+
+**Coding agents change the cost of duplication.** Writing a second implementation from a spec and a reference implementation is work agents do well. Reviewing two implementations, testing two apps and keeping them in parity is still human work. Count both when you estimate.
+
+**Exit cost differs by level.** A shared logic module can be replaced one class at a time, since each platform keeps its UI. A shared UI codebase is replaced screen by screen through the mixed state described in the caution above.
+
+**More than two platforms.** Flutter and Compose Multiplatform target desktop and web, and React Native has web and desktop targets through separate projects. If the same product must run in a browser or on a desktop, shared UI pays off more.
+
+<NoDumbQuestions>
+<dt>Which stack is the fastest?</dt>
+<dd>For typical screens, all of them reach the frame rate of the display on current phones. The differences show up at startup, in memory and in app size, where every shared-UI stack adds its runtime (see [performance and app size](/shipping/performance/)). Measure your hardest screen on a slow device.</dd>
+
+<dt>Can one app use two cross-platform stacks?</dt>
+<dd>It can, and each one adds a runtime, a build step and a boundary. Teams that do this are usually in the middle of a migration.</dd>
+
+<dt>Does Kotlin Multiplatform mean iOS engineers must write Kotlin?</dt>
+<dd>Someone on the iOS side has to read it and debug into it. Whether iOS engineers write it is a team choice. Teams where they do report fewer handoffs. Teams where they do not need a clear owner for the shared module's iOS-facing API.</dd>
+
+<dt>Is a WebView app still an option?</dt>
+<dd>For content and forms, yes, and it shares code with a web product. It gives up native scrolling, navigation and much of the platform integration. See the Capacitor line in the sidebar.</dd>
+
+<dt>Should a new app start cross-platform?</dt>
+<dd>A small team building standard screens on both platforms gets the most from sharing UI. An app built around the camera, audio, widgets or other deep platform features gets less, because most of its code is platform code in any stack.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Unit added to an existing app | Gradle module | Swift package or framework | AAR and XCFramework from `expo-brownfield` | Flutter module (add-to-app) | Shared Gradle module and its framework |
+| Host for a shared screen | `Activity`, composable | `UIViewController`, SwiftUI view | `ReactActivity`, React root view | `FlutterActivity`, `FlutterViewController` | Composable, `ComposeUIViewController` |
+| Reach a platform API | Direct | Direct | Native module | Channel or generated binding | `expect`/`actual`, direct call |
+| Update without the store | No | No | Expo Update | Shorebird | No |
+| Other targets | Wear, TV, Auto, XR | watchOS, tvOS, macOS, visionOS | Web, Windows, macOS through separate projects | Web, Windows, macOS, Linux | Desktop, web, server |
+| Toolkit page | [Android](/toolkits/android/) | [iOS](/toolkits/ios/) | [React Native](/toolkits/react-native/) | [Flutter](/toolkits/flutter/) | [KMP / CMP](/toolkits/kmp/) |
+
+<Exercise>
+Recommend a level of sharing and a stack for each team, and name the first thing you would build.
+
+1. Four web engineers who know React are starting a marketplace app for both platforms. No app exists yet.
+2. A bank has eight Android and eight iOS engineers and mature native apps. Fee calculation and form validation are implemented twice and disagree in edge cases.
+3. A video editing app has ten engineers. Most of the code is a rendering pipeline on Metal and on Android's media APIs.
+4. A retailer's native apps have a home screen and campaign pages that marketing changes every week.
+
+<Fragment slot="answer">
+1. Shared logic and UI, with React Native and Expo. The team knows React and TypeScript, the screens are lists, forms and detail pages, and there is no existing code to live beside. Build the screen with payment first, since it has the most platform integration.
+2. Shared logic with Kotlin Multiplatform. The duplicated rules are the problem, and both UIs can stay. Start with the fee calculator as one class in a shared module, with the existing test cases from both platforms run against it.
+3. Share nothing, or very little. The expensive code is platform media code, which no stack shares. A shared module for project file formats and export settings is the most that pays off.
+4. Keep the native apps and make those screens [server-driven](/architecture/server-driven-ui/). The problem is release speed for a few screens, and a new UI stack for the whole app is a much larger change than the problem needs.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** shares C# logic and UI and maps controls to platform controls. It fits teams with existing C# code and skills.
+- **Ionic / Capacitor** runs a web app in the platform WebView with a plugin bridge to native APIs. It shares the most with a web product.
+- **Lynx** is ByteDance's JavaScript framework that renders native views and runs app logic off the main thread.
+- **Skip** builds an Android app from a Swift and SwiftUI codebase, either by compiling Swift with the Swift SDK for Android or by transpiling to Kotlin. It became free and open source in 2026 ([Skip is now free and open source](https://skip.dev/blog/skip-is-free/)).
+
+## Sources
+
+- KMP / CMP: [Kotlin Multiplatform is stable](https://blog.jetbrains.com/kotlin/2023/11/kotlin-multiplatform-stable/) (Kotlin 1.9.20), [Android: Kotlin Multiplatform](https://developer.android.com/kotlin/multiplatform), [Compose Multiplatform 1.8.0](https://blog.jetbrains.com/kotlin/2025/05/compose-multiplatform-1-8-0-released-compose-multiplatform-for-ios-is-stable-and-production-ready/), [Project configuration](https://kotlinlang.org/docs/multiplatform/multiplatform-project-configuration.html), [Integration with SwiftUI](https://kotlinlang.org/docs/multiplatform/compose-swiftui-integration.html), [Android support for Kotlin Multiplatform](https://android-developers.googleblog.com/2024/05/android-support-for-kotlin-multiplatform-to-share-business-logic-across-mobile-web-server-desktop.html)
+- React Native: [Get started](https://reactnative.dev/docs/environment-setup), [Integration with existing apps](https://reactnative.dev/docs/integration-with-existing-apps), [Expo: isolated approach](https://docs.expo.dev/brownfield/isolated-approach/) (SDK 58), [Expo brownfield](https://expo.dev/blog/expo-brownfield-how-to-add-expo-to-your-existing-native-app-without-a-rewrite) (SDK 55)
+- Flutter: [Add Flutter to an existing app](https://docs.flutter.dev/add-to-app), [Multiple Flutter screens or views](https://docs.flutter.dev/add-to-app/multiple-flutters)
+- Swift: [Swift 6.3 released](https://www.swift.org/blog/swift-6.3-released/) (Swift SDK for Android), [Skip is now free and open source](https://skip.dev/blog/skip-is-free/)
+- Company posts: [Airbnb: Sunsetting React Native](https://medium.com/airbnb-engineering/sunsetting-react-native-1868ba28e30a) (2018), [Dropbox: The (not so) hidden cost of sharing code between iOS and Android](https://dropbox.tech/mobile/the-not-so-hidden-cost-of-sharing-code-between-ios-and-android) (2019), [Nubank: Backend Driven Content](https://building.nu.com/server-driven-ui-framework-at-nubank/), [Shopify: Migrating to React Native's New Architecture](https://shopify.engineering/react-native-new-architecture) (2025), [Shopify: Native is now the future of mobile at Shopify](https://shopify.engineering/back-to-native) (September 2026)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, Part 4, ch. 25 to 28 (languages and cross-platform approaches)

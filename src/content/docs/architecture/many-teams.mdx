@@ -1,0 +1,347 @@
+---
+title: "Many teams, one app"
+description: How dozens of engineers work in one mobile codebase, with a monorepo, code ownership, build caching, a merge queue and a platform team, and how each stack's build tools support it.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+An app that five engineers started now has forty, in eight product teams. The reports from one month:
+
+- The main branch failed to build on eleven days. Each time, two pull requests had passed CI separately and conflicted after merging.
+- A clean build takes 25 minutes, and CI takes 50 minutes per pull request.
+- Two teams built two date pickers. A third team built a wrapper to choose between them.
+- The upgrade to the new compiler version has been "in progress" for a quarter, because it touches every team's code and belongs to none of them.
+- The app's startup time got 40% slower over a year. Every team added one small thing at launch.
+
+The [modularization pattern](/core-patterns/dependency-injection/#modularization-the-pattern) from Level 1 splits the code. This chapter is about the people and the build: who owns each part, how the build stays fast, and who works on the things every team shares.
+
+<BrainPower>
+Forty engineers each merge one pull request a day, and CI takes 50 minutes. If every pull request must be tested on top of the newest main branch before it merges, how many can merge in an eight-hour day? What has to change to make the number forty?
+</BrainPower>
+
+## Constraints on a mobile team
+
+- **Every team ships in one binary.** A web company can deploy services independently. A mobile app is one artifact with one crash rate, one size, one startup time and one review by the store ([releases](/shipping/releases/)). One team's bug blocks everyone's release.
+- **Build time grows with the code.** Without caching, each engineer and each CI run compiles everything, and the cost grows faster than the team does.
+- **Mobile CI is expensive.** iOS builds need macOS machines, UI tests need emulators or devices, and both are slower and scarcer than Linux containers ([testing strategy](/shipping/testing/)).
+- **Shared resources have no natural owner.** Startup, app size, the navigation graph, the design system, the build configuration and the release are used by all teams and built by none of their roadmaps.
+- **Toolchain upgrades are forced.** The stores require new SDKs every year ([old app versions](/shipping/old-versions/)), so "we will upgrade later" has a deadline.
+
+## The pattern
+
+```d2
+classes: {
+  team: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  shared: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  plat: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  group: { style: { font-size: 18 } }
+}
+grid-rows: 3
+grid-gap: 16
+features: "Product teams own feature modules" {
+  class: group
+  grid-columns: 4
+  grid-gap: 12
+  a: "Search" { class: team }
+  b: "Cart" { class: team }
+  c: "Checkout" { class: team }
+  d: "Profile" { class: team }
+}
+core: "Shared modules, each with a named owner" {
+  class: group
+  grid-columns: 4
+  grid-gap: 12
+  ds: "Design\nsystem" { class: shared }
+  net: "Networking" { class: shared }
+  nav: "Navigation" { class: shared }
+  an: "Analytics" { class: shared }
+}
+platform: "Platform team" {
+  class: group
+  grid-columns: 4
+  grid-gap: 12
+  b1: "Build and CI" { class: plat }
+  b2: "Release train" { class: plat }
+  b3: "App shell,\nstartup" { class: plat }
+  b4: "Upgrades" { class: plat }
+}
+```
+
+1. **One repository per app, or one for all apps.** Every team sees the same code at the same commit. A change to a shared module and the fixes in its callers land together.
+2. **Every directory has an owner on file.** A code owners file maps paths to teams, and the code host requests their review automatically.
+3. **A module graph with rules.** Features depend on shared modules and never on each other's internals, checked in CI ([modularization](/core-patterns/dependency-injection/#modularization-the-pattern)).
+4. **Cache build outputs, locally and remotely.** A module that did not change is downloaded instead of compiled. CI fills the remote cache, and laptops read from it.
+5. **Build and test only what a change affects.** The build graph says which modules depend on the changed files. CI runs those and skips the rest.
+6. **Merge through a queue.** The queue tests each pull request on top of the ones ahead of it and merges only if the result is green, so main always builds.
+7. **A platform team owns what is shared.** Build, CI, release, app shell and toolchain upgrades are its product, and the feature teams are its users.
+8. **Budgets for shared resources.** Startup time, app size and crash rate have a number, a dashboard per team and a check in CI ([performance and app size](/shipping/performance/)).
+9. **A small app per feature.** Each team can build a demo app that contains its feature and fakes for the rest, which compiles in a fraction of the time of the full app.
+
+A pull request then travels like this:
+
+```d2
+classes: {
+  dev: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  ci: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 2
+grid-columns: 3
+grid-gap: 40
+pr: "Pull request:\nowners requested\nfrom the owners file" { class: dev }
+aff: "CI: find affected\nmodules from the\nbuild graph" { class: ci }
+cache: "Build and test them,\nreusing cached\noutputs" { class: ci }
+train: "Release train\ncuts from main" { class: ok }
+main: "main: always green" { class: ok }
+queue: "Merge queue:\nretest on top of\nqueued changes" { class: ci }
+pr -> aff -> cache -> queue -> main -> train
+```
+
+## Build configuration and caching in each stack
+
+Each sample shows where a team declares shared build settings, and how the stack avoids rebuilding what did not change.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+// build-logic/convention/src/main/kotlin/shop.feature.gradle.kts
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    compileSdk = 37
+    defaultConfig { minSdk = 26 }
+}
+
+dependencies {
+    "implementation"(project(":core:designsystem"))
+    "testImplementation"(project(":core:testing"))
+}
+```
+```properties
+# gradle.properties
+org.gradle.caching=true
+org.gradle.configuration-cache=true
+org.gradle.parallel=true
+```
+A convention plugin holds the settings every feature module shares, and a feature's own build file shrinks to `plugins { id("shop.feature") }` plus its dependencies. The Now in Android sample keeps these plugins in an included build named `build-logic` ([convention plugins](https://github.com/android/nowinandroid/blob/main/build-logic/README.md)). Gradle's build cache reuses task outputs across branches and, with a remote cache, across machines ([build cache](https://docs.gradle.org/current/userguide/build_cache.html)). The configuration cache skips the configuration phase on repeated invocations ([configuration cache](https://docs.gradle.org/current/userguide/configuration_cache.html)). Isolated Projects, incubating since Gradle 9.7, configures projects in parallel and speeds up IDE sync in large builds ([Gradle 9.7 release notes](https://docs.gradle.org/9.7.0/release-notes.html)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+// Package.swift: feature modules as targets of a local package
+let package = Package(
+    name: "ShopModules",
+    platforms: [.iOS(.v18)],
+    products: [
+        .library(name: "Cart", targets: ["Cart"]),
+        .library(name: "Checkout", targets: ["Checkout"]),
+    ],
+    targets: [
+        .target(name: "DesignSystem"),
+        .target(name: "Cart", dependencies: ["DesignSystem"]),
+        .target(name: "Checkout", dependencies: ["DesignSystem", "Cart"]),
+        .testTarget(name: "CartTests", dependencies: ["Cart"]),
+    ]
+)
+```
+```
+// Shared.xcconfig
+COMPILATION_CACHE_ENABLE_CACHING = YES
+```
+A manifest in Swift declares the module graph, which removes most merge conflicts in the Xcode project file ([organizing your code with local packages](https://developer.apple.com/documentation/xcode/organizing-your-code-with-local-packages)). Xcode 26 added compilation caching as an opt-in build setting. It stores compiler results keyed by their inputs and helps most on clean builds and branch switches ([Xcode 26 release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-26-release-notes)). Out of the box the cache is local to one machine. Tuist generates Xcode projects from Swift manifests, can replace unchanged modules with prebuilt binaries, and offers a remote store for the Xcode cache ([module cache](https://tuist.dev/en/docs/guides/features/cache/module-cache), [Xcode cache](https://tuist.dev/en/docs/guides/features/cache/xcode-cache)).
+</TabItem>
+<TabItem label="React Native">
+```json
+// package.json at the repository root
+{
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "check": "nx affected -t lint test typecheck"
+  }
+}
+```
+```sh
+# CI: has the native layer changed since the last native build?
+npx @expo/fingerprint@latest apps/shop
+```
+Feature packages live in `packages/`, apps in `apps/`, and Expo configures Metro for the workspace automatically ([Expo: work with monorepos](https://docs.expo.dev/guides/monorepos/)). Nx reads the dependency graph between packages, runs tasks only for packages a change affects, and caches task results locally and remotely ([Nx with React Native](https://nx.dev/docs/technologies/react/react-native/introduction)). The native build is the slow part, and most pull requests change only JavaScript. `@expo/fingerprint` hashes everything that feeds the native project, so CI can reuse the previous native binary when the hash is unchanged and bundle only the JavaScript ([Expo Fingerprint](https://docs.expo.dev/versions/latest/sdk/fingerprint/)). Rock, from Callstack, builds a remote cache of native artifacts on the same idea ([Rock](https://github.com/callstackincubator/rock)).
+</TabItem>
+<TabItem label="Flutter">
+```yaml
+# pubspec.yaml at the repository root
+name: shop_workspace
+publish_to: none
+environment:
+  sdk: ^3.14.0
+workspace:
+  - apps/shop
+  - packages/design_system
+  - packages/cart
+  - packages/checkout
+```
+```yaml
+# packages/cart/pubspec.yaml
+name: cart
+environment:
+  sdk: ^3.14.0
+resolution: workspace
+dependencies:
+  design_system: any
+```
+A pub workspace resolves every package in the repository together, so all of them use the same version of each dependency and the analyzer loads one resolution ([pub workspaces](https://dart.dev/tools/pub/workspaces)). Melos 7 builds on workspaces and runs scripts across packages, with filters such as "only packages changed since this branch diverged" ([Melos](https://melos.invertase.dev/)). Dart compiles incrementally during development, and the `flutter` tool has no remote build cache. For CI, the affected-package filter is the main saving, along with caching the Gradle and Xcode parts of the build with their own tools.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// shared/umbrella/build.gradle.kts: the one framework the iOS app links
+kotlin {
+    listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
+        target.binaries.framework {
+            baseName = "Shared"
+            isStatic = true
+            export(project(":feature:cart"))
+            export(project(":feature:checkout"))
+        }
+    }
+    sourceSets.commonMain.dependencies {
+        api(project(":feature:cart"))
+        api(project(":feature:checkout"))
+    }
+}
+```
+KMP modules are Gradle modules, so convention plugins, the build cache and the configuration cache from the Android tab apply. The iOS side adds one constraint: the app should link a single Kotlin framework, so an umbrella module exports the feature modules ([project configuration](https://kotlinlang.org/docs/multiplatform/multiplatform-project-configuration.html)). Kotlin/Native compilation and linking are slower than JVM compilation, and the release link of the framework is the step to watch. Teams whose iOS engineers rarely change Kotlin publish the framework as a prebuilt XCFramework in a Swift package, so an iOS build does not run Gradle ([Swift package export](https://kotlinlang.org/docs/multiplatform/multiplatform-spm-export.html)).
+</TabItem>
+</Tabs>
+
+## Ownership and the merge queue
+
+A code owners file lives in the repository and is reviewed like code:
+
+```
+# .github/CODEOWNERS
+/feature/cart/            @shop/cart-team
+/feature/checkout/        @shop/checkout-team
+/core/designsystem/       @shop/design-system
+/build-logic/             @shop/mobile-platform
+/gradle/libs.versions.toml @shop/mobile-platform
+```
+
+GitHub requests a review from the matching team on every pull request that touches those paths, and a branch rule can require their approval ([about code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)).
+
+A merge queue fixes the eleven broken days from the opening. A pull request that passed CI was tested against the main branch as it was when CI started. The queue creates a temporary branch with main, the changes already queued and the new change, runs the required checks there, and merges only on success ([managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)). Queues test several changes in parallel on the assumption that those ahead will pass. Uber describes this for its monorepos, which include its mobile apps, as SubmitQueue ([Slashing CI costs at Uber](https://www.uber.com/blog/slashing-ci-costs-at-uber/)).
+
+<Aside type="caution" title="Watch it!">
+A queue multiplies flaky tests. If 2% of runs fail for no reason and each failure ejects a pull request and restarts those behind it, a busy queue stalls. Measure flakiness per test, quarantine tests above a threshold automatically, and make the quarantine list someone's job to empty.
+</Aside>
+
+## Build systems beyond the default
+
+| Build system | Used for | Gain | Cost |
+| --- | --- | --- | --- |
+| Gradle, Xcode with Swift packages | Most apps | Supported by the IDE and every library | Caching and affected-module logic need setup, and Xcode's cache sharing is limited |
+| Bazel | Large Android, iOS and mixed repositories | Hermetic builds, remote cache and remote execution, one graph across languages | A build team, custom IDE integration, rules for every tool |
+| Buck2 | Meta's apps, some others | Similar to Bazel | Smaller community outside Meta |
+
+Bazel 9 is the current long-term support release ([Bazel 9 LTS](https://blog.bazel.build/2026/01/20/bazel-9.html)). Published migrations show the size at which companies made the move. Uber moved its iOS and Android code to monorepos built with Buck in 2017 ([Faster Together: Uber Engineering's iOS Monorepo](https://www.uber.com/blog/ios-monorepo/)). Airbnb adopted Buck for a 1.5 million line iOS codebase with about 75 engineers, generated small "dev apps" per feature, and later migrated to Bazel ([Designing for productivity in a large-scale iOS application](https://medium.com/airbnb-engineering/designing-for-productivity-in-a-large-scale-ios-application-9376a430a0bf), [Migrating our iOS build system from Buck to Bazel](https://medium.com/airbnb-engineering/migrating-our-ios-build-system-from-buck-to-bazel-ddd6f3f25aa3)). Spotify moved its iOS app, with more than 200 engineers, to Bazel without pausing releases ([Switching build systems, seamlessly](https://engineering.atspotify.com/2023/10/switching-build-systems-seamlessly)).
+
+All of these teams had dedicated build engineers before they switched. Below that size, the default build system with caching turned on and a wide, shallow module graph goes a long way.
+
+## The platform team
+
+A platform team builds for other engineers. Team Topologies describes it as a team that provides a compelling internal product to accelerate delivery by the stream-aligned teams ([key concepts](https://teamtopologies.com/key-concepts)). In a mobile organization it usually owns:
+
+- the build configuration, CI pipelines and the caches
+- the release train and the release tooling ([releases](/shipping/releases/))
+- the app shell: startup, navigation host, dependency graph root, login state
+- shared libraries: networking, analytics, feature flags, design system components, often with the design team
+- toolchain and dependency upgrades, including the yearly store requirements
+- the dashboards for crash rate, startup and size, and the budgets per team
+
+It works when the team treats those as products with users: it measures build time and CI wait as its own metrics, announces changes, writes migration tools and does large mechanical migrations itself.
+
+## Trade-offs and scale
+
+**One repository or several.** A monorepo makes cross-cutting changes atomic and needs tooling so that people do not build and test everything. Separate repositories with versioned libraries give teams independence and turn every shared change into a release, an upgrade and a version conflict. Most large mobile teams choose one repository per platform or one for both.
+
+**Start the platform team late, and small.** With three teams, a rotation or a guild can own the build. A dedicated team is justified when shared work is visibly not getting done: upgrades stall, CI time climbs, nobody can explain the release process.
+
+**Keep the platform team out of the review path.** If every change to shared code waits for its review, it becomes the bottleneck it was meant to remove. Owners files should point at the team that knows the code best, and the platform team should prefer lint rules and templates to manual review.
+
+**Shared modules attract everything.** A `common` or `utils` module that every feature depends on rebuilds the world when it changes. Split it by purpose and keep each piece small.
+
+**Budgets need enforcement.** A size or startup budget that only appears on a dashboard is ignored. Fail the pull request when a module's contribution grows past its threshold, with an override that requires a reason.
+
+**Many teams, one train.** A regular train with a release captain, feature flags for unfinished work and clear hotfix criteria lets teams ship without coordinating with each other ([feature flags](/shipping/feature-flags/)).
+
+**Cross-platform apps have two layers of this.** A React Native or Flutter monorepo still contains Gradle and Xcode builds. The platform team needs people for the shared layer and for both native ones.
+
+**Agents are heavy users of the build.** Coding agents run builds and tests far more often than people do. A fast, cacheable, command-line build and small demo apps help them for the same reasons they help engineers, and CI capacity has to be planned for the extra load.
+
+<NoDumbQuestions>
+<dt>How many modules is too many?</dt>
+<dd>The count matters less than the shape. A wide graph, where many features depend on a few small shared modules, builds in parallel and caches well. A deep chain, where each module depends on the previous one, rebuilds from the point of change to the end.</dd>
+
+<dt>Should Android and iOS share a repository?</dt>
+<dd>With Kotlin Multiplatform, React Native or Flutter, yes, since one change spans both. For two native apps it helps when API schemas, design tokens and specs are shared in the same place, and it is mostly neutral otherwise.</dd>
+
+<dt>Is a remote cache safe?</dt>
+<dd>Only CI on protected branches should write to it, and everyone may read. If laptops can write, one misconfigured machine poisons everyone's build.</dd>
+
+<dt>Can each team release its own feature separately?</dt>
+<dd>Not as a binary. They can release behaviour separately, through feature flags, server-driven screens and, in stacks that allow it, over-the-air updates.</dd>
+
+<dt>Who fixes a flaky test in shared code?</dt>
+<dd>The owner on file for that path. That is the practical use of an owners file beyond review requests: every test, alert and crash can be routed to a team.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Workspace definition | `settings.gradle.kts` | Xcode workspace, `Package.swift`, Tuist manifests | `workspaces` in `package.json` | `workspace` in `pubspec.yaml` | `settings.gradle.kts` |
+| Shared build settings | Convention plugins | `.xcconfig` files, Tuist helpers | Shared configs as workspace packages | Shared `analysis_options.yaml`, Melos scripts | Convention plugins |
+| Pinned versions | Version catalog | `Package.resolved` | Lockfile | `pubspec.lock` at the workspace root | Version catalog |
+| Local build cache | Gradle build cache | Derived data, compilation cache | Metro cache, Nx cache | Incremental Dart compilation | Gradle build cache |
+| Remote build cache | Gradle remote cache | Tuist, Bazel | Nx, fingerprint-based native reuse | None built in | Gradle remote cache |
+| Affected-only tasks | Graph-based plugins, Bazel query | Tuist selective testing, Bazel query | `nx affected` | Melos `--diff` filter | Same as Android |
+| Demo app per feature | Extra application module | Extra app target | Extra app in `apps/` | Example app in the package | Extra application module |
+
+<Exercise>
+Use the numbers from the opening: forty engineers, 50 minutes of CI per pull request, main broken eleven days in a month, a 25-minute clean build and a compiler upgrade nobody owns. You may fund three engineers for a platform team. Write their plan for the first two quarters, in order.
+
+<Fragment slot="answer">
+1. Measure first. Record CI duration per step, local build times, cache hit rates and the causes of each main-branch breakage. Publish them weekly.
+2. Add a merge queue. This removes the semantic merge conflicts behind most of the broken days, and it needs configuration and no new code. Fix or quarantine the flakiest tests in the same week, because the queue will expose them.
+3. Turn on build caching with a remote cache that only CI writes. Expect the largest gain for pull requests that touch one feature.
+4. Run only affected modules in CI. With a queue, a cache and affected-only tests, a typical pull request should take minutes.
+5. Add the owners file and convention plugins or shared build settings, so that module setup is one line and every path has a reviewer.
+6. Take the compiler upgrade. The platform team does the mechanical changes across all modules in one branch per module group, with the owners reviewing.
+7. Set budgets for startup and size with a CI check, then hand each team its numbers.
+
+The Brain Power answer: with serial testing at 50 minutes each, fewer than ten pull requests merge in eight hours. Forty a day needs shorter runs, from caching and affected-only tests, and parallel speculative runs in the queue.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** solutions use MSBuild with central package management, and the same ownership and queue practices apply.
+- **Ionic / Capacitor** apps are web monorepos with the usual JavaScript workspace tools, plus the two native projects.
+- **Lynx** projects follow the JavaScript workspace model as React Native does.
+
+## Sources
+
+- Android: [Now in Android convention plugins](https://github.com/android/nowinandroid/blob/main/build-logic/README.md), [Gradle build cache](https://docs.gradle.org/current/userguide/build_cache.html), [Gradle configuration cache](https://docs.gradle.org/current/userguide/configuration_cache.html), [Gradle 9.7 release notes](https://docs.gradle.org/9.7.0/release-notes.html) (Isolated Projects incubating)
+- iOS: [Organizing your code with local packages](https://developer.apple.com/documentation/xcode/organizing-your-code-with-local-packages), [Xcode 26 release notes](https://developer.apple.com/documentation/xcode-release-notes/xcode-26-release-notes) (compilation caching), [Tuist module cache](https://tuist.dev/en/docs/guides/features/cache/module-cache), [Tuist Xcode cache](https://tuist.dev/en/docs/guides/features/cache/xcode-cache)
+- React Native: [Expo: work with monorepos](https://docs.expo.dev/guides/monorepos/), [Expo Fingerprint](https://docs.expo.dev/versions/latest/sdk/fingerprint/), [Nx with React Native](https://nx.dev/docs/technologies/react/react-native/introduction), [Rock](https://github.com/callstackincubator/rock)
+- Flutter: [Pub workspaces](https://dart.dev/tools/pub/workspaces) (Dart 3.6+), [Melos](https://melos.invertase.dev/) (7.x)
+- KMP: [Project configuration](https://kotlinlang.org/docs/multiplatform/multiplatform-project-configuration.html), [Swift package export](https://kotlinlang.org/docs/multiplatform/multiplatform-spm-export.html)
+- Process: [GitHub: about code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners), [GitHub: managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue), [Team Topologies: key concepts](https://teamtopologies.com/key-concepts)
+- Build systems and company posts: [Bazel 9 LTS](https://blog.bazel.build/2026/01/20/bazel-9.html), [Uber: Faster Together](https://www.uber.com/blog/ios-monorepo/) (2017), [Uber: Slashing CI costs](https://www.uber.com/blog/slashing-ci-costs-at-uber/), [Airbnb: Designing for productivity in a large-scale iOS application](https://medium.com/airbnb-engineering/designing-for-productivity-in-a-large-scale-ios-application-9376a430a0bf), [Airbnb: Migrating our iOS build system from Buck to Bazel](https://medium.com/airbnb-engineering/migrating-our-ios-build-system-from-buck-to-bazel-ddd6f3f25aa3), [Spotify: Switching build systems, seamlessly](https://engineering.atspotify.com/2023/10/switching-build-systems-seamlessly) (2023)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, Part 3, ch. 20 and 22 to 24 (large engineering teams, build and merge times, platform teams)

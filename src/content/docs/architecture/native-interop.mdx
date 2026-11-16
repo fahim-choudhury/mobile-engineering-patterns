@@ -1,0 +1,304 @@
+---
+title: Native interop
+description: How shared code calls platform APIs and vendor SDKs in each stack, how to design the boundary, and what goes wrong with threads, types and builds when two runtimes meet.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+Your app has to take card payments with a Bluetooth reader. The vendor ships an SDK as an `.aar` for Android and an `.xcframework` for iOS, with callback-based APIs. The reports from the integration:
+
+- The community plugin for your stack was last released two years ago and does not build.
+- The integration works in debug and crashes in the release build, because the code shrinker removed a class the SDK looks up by name.
+- "Reader connected" arrives on a background thread, and the UI update that follows crashes on one platform and silently does nothing on the other.
+- A screen that passes camera frames across the boundary drops to 20 frames per second.
+- The vendor releases version 4. The iOS build breaks, and nobody on the team has opened Xcode in months.
+
+A native app calls the SDK directly. Every other stack reaches it through a boundary between two languages and two runtimes, and that boundary is code you own.
+
+<BrainPower>
+Your shared code calls `reader.connect()` and awaits the result. On which thread does the vendor SDK's callback run, and on which thread does your shared code resume? Who decides each of those?
+</BrainPower>
+
+## Constraints at the boundary
+
+- **Two type systems.** A Kotlin sealed class, a Swift enum with associated values, a TypeScript union and a Dart sealed class express the same idea and none maps to another automatically.
+- **Two memory managers.** Garbage-collected runtimes (ART, Hermes, Dart, Kotlin/Native) meet reference counting on iOS. An object held from both sides needs a rule for who releases it.
+- **Threads.** Platform UI APIs must be called on the main thread. JavaScript and Dart each have their own execution model ([concurrency](/foundations/concurrency/)), and vendor SDKs call back on threads of their choosing.
+- **Different async models.** Coroutines, Swift concurrency, promises and futures have to be translated at the boundary, including cancellation and errors.
+- **Platform context.** Many Android APIs need a `Context` or the current `Activity`, and permission prompts need a visible screen. Shared code has neither unless the boundary provides it.
+- **Two build systems.** The native side builds with Gradle and with Xcode, each with its own dependency manager, and both have to resolve the vendor SDK.
+
+## The pattern
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  gen: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  sdk: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+app: "Shared app code:\nawait reader.connect()" { class: code }
+iface: "Your interface: CardReader\n(small, typed, async)" { class: code }
+glue: "Generated glue:\nCodegen, Pigeon, Expo Modules,\nKotlin/Native bindings" { class: gen }
+impl: "Platform implementation\n(Kotlin and Swift):\nthreads, errors, lifecycle" { class: os }
+vendor: "Vendor SDK\n(.aar / .xcframework)" { class: sdk }
+app -> iface -> glue -> impl -> vendor
+```
+
+1. **Define a small interface in your own terms.** `connect()`, `charge(amount)`, a stream of reader states. The vendor's types stay on the platform side, so replacing the vendor changes one implementation.
+2. **Generate the glue.** Every stack has a tool that produces the cross-language code from a typed definition. Hand-written string-keyed messages fail at runtime, and generated code fails at compile time.
+3. **Make calls coarse.** One call that returns a result is cheaper than twenty that each cross the boundary. Batch, and pass identifiers or file paths in place of large buffers.
+4. **Decide the thread on each side.** The platform implementation hops to the thread the SDK needs, and delivers results where the shared runtime expects them.
+5. **Translate errors into the interface's own error type.** An `NSError` code or a Java exception class means nothing to the shared side.
+6. **Bind to the lifecycle.** Start and stop the SDK with the screen or the app, and unregister listeners ([app lifecycle](/foundations/app-lifecycle/)).
+7. **Fake the interface in tests.** Shared code is tested against a fake reader. The platform implementation gets a few device tests ([testing strategy](/shipping/testing/)).
+
+A call and its callback cross the boundary like this:
+
+```d2
+classes: {
+  code: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  sdk: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+shared: "Shared code" { class: code }
+impl: "Platform\nimplementation" { class: os }
+vendor: "Vendor SDK" { class: sdk }
+shared -> impl: "connect()" { style.font-size: 16 }
+impl -> vendor: "connect(callback)\non the main thread" { style.font-size: 16 }
+vendor -> impl: "onConnected(info)\non an SDK thread" { style.font-size: 16 }
+impl -> impl: "map types and errors" { style.font-size: 16 }
+impl -> shared: "resume with ReaderInfo\non the caller's thread" { style.font-size: 16 }
+```
+
+## A vendor SDK behind an interface in each stack
+
+`ReaderSdk` stands for the vendor's callback API. Each sample exposes it as one async `connect()` call that returns the reader's model name.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+class CardReader(private val sdk: ReaderSdk) {
+    suspend fun connect(): String = suspendCancellableCoroutine { cont ->
+        val session = sdk.connect(object : ReaderSdk.Callback {
+            override fun onConnected(info: ReaderSdk.Info) = cont.resume(info.model)
+            override fun onError(code: Int) =
+                cont.resumeWithException(ReaderException(code))
+        })
+        cont.invokeOnCancellation { session.cancel() }
+    }
+}
+```
+Kotlin calls the SDK directly, so the only translation is from callbacks to a coroutine. `suspendCancellableCoroutine` resumes the caller on its own dispatcher and forwards cancellation to the SDK ([API reference](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/suspend-cancellable-coroutine.html)). Android's own boundary is JNI, which connects Kotlin and Java to C and C++ libraries built with the NDK. A JNI call is declared with `external fun` and has rules of its own for threads and object references ([JNI tips](https://developer.android.com/ndk/guides/jni-tips)). If the SDK finds classes by reflection, the library's consumer rules must keep them from R8 ([shrink, obfuscate and optimize](https://developer.android.com/build/shrink-code)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+final class CardReader {
+    private let sdk: ReaderSDK
+    init(sdk: ReaderSDK) { self.sdk = sdk }
+
+    func connect() async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            sdk.connect { info, error in
+                if let info {
+                    continuation.resume(returning: info.model)
+                } else {
+                    continuation.resume(throwing: ReaderError(underlying: error))
+                }
+            }
+        }
+    }
+}
+```
+Swift calls Objective-C and C APIs directly, and Xcode imports many completion-handler methods as `async` automatically. For the rest, a checked continuation converts a callback into an `async` function and reports a continuation that is resumed twice or never ([withCheckedThrowingContinuation](https://developer.apple.com/documentation/swift/withcheckedthrowingcontinuation(isolation:function:_:))). Swift can also call C++ directly once interoperability is enabled for the target, a feature available since Swift 5.9 ([mixing Swift and C++](https://www.swift.org/documentation/cxx-interop/)).
+</TabItem>
+<TabItem label="React Native">
+```swift
+// ios/CardReaderModule.swift
+public class CardReaderModule: Module {
+  let sdk = ReaderSDK.shared
+
+  public func definition() -> ModuleDefinition {
+    Name("CardReader")
+
+    AsyncFunction("connect") { (promise: Promise) in
+      self.sdk.connect { info, error in
+        if let info { promise.resolve(info.model) }
+        else { promise.reject("E_READER", error?.localizedDescription ?? "Unknown error") }
+      }
+    }
+  }
+}
+```
+```ts
+// CardReader.ts
+import { requireNativeModule } from 'expo';
+
+const native = requireNativeModule('CardReader');
+export const connect = (): Promise<string> => native.connect();
+```
+The Expo Modules API defines a module in Swift and in Kotlin with the same small DSL, and the Kotlin file mirrors the Swift one. An `AsyncFunction` returns a promise to JavaScript, and its native body runs off the JavaScript thread by default ([module API reference](https://docs.expo.dev/modules/module-api/)). React Native's own mechanism is the Turbo Native Module: you write a typed TypeScript spec, and Codegen produces the C++, Kotlin and Objective-C interfaces your native code implements ([Turbo Native Modules](https://reactnative.dev/docs/turbo-native-modules-introduction)). Both run on JSI, so calls do not pass through a serialized message queue ([runtime anatomy](/foundations/runtime-anatomy/#calling-into-the-platform)). Nitro Modules (0.37) are a third-party alternative that generates statically typed C++ bindings ([Nitro](https://nitro.margelo.com/)).
+</TabItem>
+<TabItem label="Flutter">
+```dart
+// pigeons/card_reader.dart: the definition Pigeon generates code from
+import 'package:pigeon/pigeon.dart';
+
+@HostApi()
+abstract class CardReaderApi {
+  @async
+  String connect();
+}
+```
+```kotlin
+// android: implement the generated interface
+class CardReaderImpl(private val sdk: ReaderSdk) : CardReaderApi {
+    override fun connect(callback: (Result<String>) -> Unit) {
+        sdk.connect(object : ReaderSdk.Callback {
+            override fun onConnected(info: ReaderSdk.Info) =
+                callback(Result.success(info.model))
+            override fun onError(code: Int) =
+                callback(Result.failure(FlutterError("E_READER", "code $code")))
+        })
+    }
+}
+```
+Pigeon generates the Dart, Kotlin and Swift sides of a platform channel from one Dart definition, so method names and argument types are checked by the compilers ([Pigeon](https://pub.dev/packages/pigeon), [platform channels](https://docs.flutter.dev/platform-integration/platform-channels)). Since Flutter 3.50, direct native interop is stable: FFIgen generates Dart bindings for C and Objective-C APIs, and JNIgen does so for Java and Kotlin, and Dart calls them synchronously with no message channel ([stable direct native interoperability](https://flutter.dev/blog/stable-native-interop)). Swift APIs are reachable this way when they are exposed to Objective-C. A Pigeon mode built on these bindings is in preview in the same release.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain
+interface CardReader {
+    suspend fun connect(): String
+}
+
+// androidMain: the same code as the Android tab, implementing CardReader
+
+// iosMain: Kotlin calls the Objective-C API of the SDK directly
+class IosCardReader(private val sdk: ReaderSDK) : CardReader {
+    override suspend fun connect(): String = suspendCancellableCoroutine { cont ->
+        sdk.connectWithCompletion { info, error ->
+            if (info != null) cont.resume(info.model)
+            else cont.resumeWithException(ReaderException(error?.code ?: -1))
+        }
+    }
+}
+```
+Kotlin/Native generates Kotlin bindings for Objective-C frameworks, so `iosMain` code calls the SDK with no bridge and no generated message layer ([Objective-C interop](https://kotlinlang.org/docs/native-objc-interop.html)). Since Kotlin 2.4.0, a Gradle block can declare Swift packages as dependencies and import their Objective-C APIs, a feature in Alpha ([SwiftPM import](https://kotlinlang.org/docs/multiplatform/multiplatform-spm-import.html)). An SDK that exposes only Swift APIs is not visible to Kotlin. For that case, declare the interface in `commonMain`, implement it in Swift inside the iOS app, and pass the implementation into the shared module at startup.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Test the integration in a release build on a device before you trust it. Code shrinking, stripped symbols and missing privacy manifest entries only show up there. And never assume the callback thread: assert it in debug builds, and hop to the main thread in the platform implementation before touching UI.
+</Aside>
+
+## Embedding native views
+
+A map, a camera preview or a vendor's payment form is a view, and views cross the boundary differently from function calls.
+
+| Stack | Embed a platform view | Cost |
+| --- | --- | --- |
+| Android (Compose) | `AndroidView` composable ([docs](https://developer.android.com/develop/ui/compose/migrate/interoperability-apis/views-in-compose)) | Low: same view system underneath |
+| iOS (SwiftUI) | `UIViewRepresentable` ([docs](https://developer.apple.com/documentation/swiftui/uiviewrepresentable)) | Low |
+| React Native | Fabric native component, or a `View` in an Expo module ([docs](https://reactnative.dev/docs/fabric-native-components-introduction)) | Low: React Native already renders platform views |
+| Flutter | Platform views: `AndroidView`, `UiKitView` ([Android](https://docs.flutter.dev/platform-integration/android/platform-views), [iOS](https://docs.flutter.dev/platform-integration/ios/platform-views)) | Composition with Flutter's own surface costs performance, and the mode you pick decides how much |
+| CMP on iOS | `UIKitView`, `UIKitViewController` ([docs](https://kotlinlang.org/docs/multiplatform/compose-uikit-integration.html)) | Same class of cost as Flutter: a native view inside a self-drawn canvas |
+
+Gestures, focus, accessibility and z-order across the seam need testing in the two self-rendering stacks. Keep the native view rectangular and avoid drawing shared UI over it where you can.
+
+## Kotlin seen from Swift
+
+A shared Kotlin module is consumed by Swift, which is an interop boundary of its own. By default the Kotlin compiler exports an Objective-C header, and Swift sees Kotlin through Objective-C.
+
+| Kotlin | Through the Objective-C export | Through Swift export (Alpha since Kotlin 2.4.0) |
+| --- | --- | --- |
+| `suspend fun` | Completion handler, callable as `async` with limits | `async` function |
+| `Flow<T>` | An opaque object, usually wrapped by hand or by a library | `AsyncSequence` |
+| `sealed class` | Class hierarchy without exhaustive `switch` | `enum` |
+| Top-level function | Method on a generated `FileKt` class | Module-level function |
+
+The Objective-C column is from the [interop reference](https://kotlinlang.org/docs/native-objc-interop.html), the Swift export column from its [documentation](https://kotlinlang.org/docs/native-swift-export.html) and the [Kotlin 2.4.0 notes](https://kotlinlang.org/docs/whatsnew24.html). Until Swift export is stable, many teams add [SKIE](https://skie.touchlab.co/), a compiler plugin that generates Swift wrappers for flows, suspend functions and sealed classes on top of the Objective-C export.
+
+## Trade-offs and scale
+
+**A community plugin or your own module.** A maintained plugin saves the first week. An abandoned one costs more than writing forty lines of glue. Check the last release date, whether it supports the current architecture of your stack, and whether you could maintain a fork.
+
+**Chatty boundaries.** A call that crosses languages costs more than a local call, and a hundred per frame is visible. Move the loop to one side: let native code process the camera frames and send the result.
+
+**Large data.** Bytes copied across the boundary cost time and memory twice. Pass a file path, a texture handle or a shared buffer. React Native supports `ArrayBuffer` in Turbo Native Modules, and Dart FFI passes pointers.
+
+**Synchronous or asynchronous.** A synchronous call is simple and blocks the calling thread for as long as the native side takes. Use it for values that are already in memory. Anything that touches disk, network, Bluetooth or the user is asynchronous.
+
+**Two toolchains stay in the team.** A cross-platform team still needs people who can read a Gradle error and an Xcode linker error. Keep both native builds in CI, and upgrade the vendor SDK on both platforms in the same change.
+
+**One native dependency, several consumers.** If two plugins bundle different versions of the same native SDK, the build fails or, worse, picks one. Declare the SDK version in one place.
+
+**Lifecycle of the native side.** Hot reload restarts the shared runtime while the native SDK keeps its state. A second `connect()` after a reload must not crash. Make the native implementation idempotent.
+
+**App size and startup.** Each native SDK adds binary size, and many initialise at launch ([performance and app size](/shipping/performance/)). Initialise the reader SDK when the payment screen opens.
+
+<NoDumbQuestions>
+<dt>Is the React Native "bridge" still the bottleneck?</dt>
+<dd>The asynchronous JSON bridge is gone. Since 0.82 only the New Architecture runs, and native modules are called through JSI ([runtime anatomy](/foundations/runtime-anatomy/#calling-into-the-platform)). A boundary still exists, and chatty calls across it still cost time.</dd>
+
+<dt>Should a Flutter plugin still use platform channels?</dt>
+<dd>Channels with Pigeon remain supported and are what most existing plugins use. For new code that wraps a Java, Kotlin, C or Objective-C API, generated bindings avoid the serialization step and allow synchronous calls. The Flutter team's announcement describes when each fits.</dd>
+
+<dt>Can Kotlin call a Swift-only API?</dt>
+<dd>Not directly. Kotlin/Native imports C and Objective-C declarations. Wrap the Swift API in a small class marked `@objc`, or implement a Kotlin interface in Swift and inject it.</dd>
+
+<dt>Where should the permission prompt live?</dt>
+<dd>On the platform side, behind the same interface: `requestBluetoothPermission()` returns granted or denied. The shared code decides when to ask, and the platform code knows how.</dd>
+
+<dt>Do I need to write the native side twice?</dt>
+<dd>Yes, once per platform. The interface and everything above it is shared. Keep the platform implementations thin so that the duplicated part is mapping code.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Boundary mechanism | JNI to C and C++ | Objective-C, C and C++ interop | JSI | Platform channels, FFI, JNI | Kotlin/Native bindings, JNI on Android |
+| Typed definition | C header | Bridging header, module map | TypeScript spec, Expo module DSL | Pigeon file, FFIgen or JNIgen config | `expect`/`actual`, interface |
+| Glue generator | `javac -h`, Android Studio | Xcode | Codegen, Expo Modules, Nitro | Pigeon, FFIgen, JNIgen | Kotlin/Native compiler, SKIE |
+| Callback to async | `suspendCancellableCoroutine` | `withCheckedThrowingContinuation` | Promise | `Future`, `@async` | `suspendCancellableCoroutine` |
+| Event stream | `callbackFlow` | `AsyncStream` | Event emitter | `EventChannel`, `@EventChannelApi` | `callbackFlow` |
+| Native view inside shared UI | `AndroidView` | `UIViewRepresentable` | Fabric native component | Platform view | `AndroidView`, `UIKitView` |
+| Native dependency declared in | Gradle | Swift package, CocoaPods | Autolinking, config plugin | Plugin's Gradle file and podspec or Swift package | Gradle, SwiftPM import |
+
+<Exercise>
+A Flutter app shows a live camera preview and runs a vendor's barcode SDK on each frame. The first version sends every frame from the native camera callback to Dart over a method channel, calls the SDK from Dart through another channel, and draws the result. It runs at 12 frames per second, and after a hot restart the camera fails with "already in use". Redesign the boundary.
+
+<Fragment slot="answer">
+1. Keep the frames on the native side. The platform implementation owns the camera session and passes each frame to the barcode SDK directly, on a background queue. Nothing large crosses the boundary.
+2. Send results only. The interface exposes a stream of detected barcodes (a few strings and a rectangle), through an event channel or a generated binding. That is a few hundred bytes per detection.
+3. Show the preview as a platform view or a texture, so the pixels go from the camera to the screen without passing through Dart.
+4. Make start and stop idempotent. `start()` on a running session returns the existing one, and the native side releases the camera when the Flutter engine detaches. That fixes the hot restart error.
+5. Define the interface in Pigeon or with JNIgen and FFIgen, with one error type for "permission denied", "camera busy" and "SDK error".
+6. Test the Dart code against a fake that emits barcodes, and run one device test per platform for the native implementation.
+
+The same redesign applies to React Native and Compose Multiplatform. The rule is that the loop and the large data stay on one side.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** binds native libraries through binding projects that generate C# wrappers for Java and Objective-C APIs.
+- **Ionic / Capacitor** plugins expose native methods to JavaScript in the WebView. Calls are asynchronous and arguments are serialized as JSON.
+- **Lynx** exposes native modules to its JavaScript runtime in a way similar to React Native's.
+
+## Sources
+
+- Android: [JNI tips](https://developer.android.com/ndk/guides/jni-tips), [Shrink, obfuscate and optimize your app](https://developer.android.com/build/shrink-code), [Views in Compose](https://developer.android.com/develop/ui/compose/migrate/interoperability-apis/views-in-compose), [suspendCancellableCoroutine](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/suspend-cancellable-coroutine.html)
+- iOS: [withCheckedThrowingContinuation](https://developer.apple.com/documentation/swift/withcheckedthrowingcontinuation(isolation:function:_:)), [Mixing Swift and C++](https://www.swift.org/documentation/cxx-interop/) (Swift 5.9+), [UIViewRepresentable](https://developer.apple.com/documentation/swiftui/uiviewrepresentable)
+- React Native: [Turbo Native Modules](https://reactnative.dev/docs/turbo-native-modules-introduction), [Fabric native components](https://reactnative.dev/docs/fabric-native-components-introduction), [Expo Modules API reference](https://docs.expo.dev/modules/module-api/) (SDK 58), [React Native 0.88](https://reactnative.dev/blog/2026/10/19/react-native-0.88), [Nitro Modules](https://nitro.margelo.com/) (0.37)
+- Flutter: [Platform channels](https://docs.flutter.dev/platform-integration/platform-channels), [Pigeon](https://pub.dev/packages/pigeon), [Announcing stable direct native interoperability](https://flutter.dev/blog/stable-native-interop) (Flutter 3.50), [Android platform views](https://docs.flutter.dev/platform-integration/android/platform-views), [iOS platform views](https://docs.flutter.dev/platform-integration/ios/platform-views)
+- KMP / CMP: [Interoperability with Swift and Objective-C](https://kotlinlang.org/docs/native-objc-interop.html), [Swift export](https://kotlinlang.org/docs/native-swift-export.html) (Alpha), [What's new in Kotlin 2.4.0](https://kotlinlang.org/docs/whatsnew24.html), [SwiftPM import](https://kotlinlang.org/docs/multiplatform/multiplatform-spm-import.html) (Alpha), [Integration with UIKit](https://kotlinlang.org/docs/multiplatform/compose-uikit-integration.html), [SKIE](https://skie.touchlab.co/)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, Part 4 (cross-platform approaches)

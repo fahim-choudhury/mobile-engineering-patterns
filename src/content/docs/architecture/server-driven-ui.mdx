@@ -1,0 +1,372 @@
+---
+title: Server-driven UI
+description: How a backend can decide which components a screen shows, how the app renders them from a catalog it ships with, and how to keep old versions, offline use and store rules intact.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+Marketing wants the home screen rearranged for a sale that starts on Friday: a countdown banner at the top, the product carousel moved up, the loyalty card hidden for a week. The reports:
+
+- The next release train leaves in nine days, and review plus rollout adds more ([releases](/shipping/releases/)).
+- After the release, a third of users still run a version with the old layout.
+- The Android and iOS teams implement the banner slightly differently, and the countdown ends an hour apart.
+- When the sale ends, removing the banner needs another release.
+
+A website would change its template and deploy. The idea behind server-driven UI is to move the same decision to the server for a mobile screen: the app ships a set of components, and each response says which of them to show, in which order, with which content.
+
+<BrainPower>
+Your app's home screen shows a banner, a product row and a list of orders. If the server could send a fourth kind of section tomorrow, what should the version of your app that is installed today do with it?
+</BrainPower>
+
+## Constraints on a phone
+
+- **Releases are slow and optional.** A layout compiled into the binary changes at the speed of the release train, and only for users who update ([old app versions](/shipping/old-versions/)).
+- **Every old version receives the new response.** The server cannot assume the client knows a component it added last week.
+- **The stores restrict downloaded code.** Apple's guideline 2.5.2 says apps may not "download, install, or execute code which introduces or changes features or functionality of the app" ([App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/#software-requirements)). Google Play forbids downloading executable code such as dex or native libraries from outside Play, and requires interpreted code loaded at runtime to stay within its policies ([device and network abuse](https://support.google.com/googleplay/android-developer/answer/16559646)).
+- **Screens must work offline and start fast.** A screen that needs a round trip before it can draw anything is slower than one compiled in ([persistence](/core-patterns/persistence/)).
+- **The compiler no longer checks the screen.** A typo in a component name is a runtime condition on a user's phone.
+
+## The pattern
+
+How much the server controls is a range:
+
+```d2
+classes: {
+  a: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  b: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  c: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  d: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 2
+grid-columns: 4
+grid-gap: 8
+h1: "Content" { class: head }
+h2: "Sections" { class: head }
+h3: "Layout\nprimitives" { class: head }
+h4: "Code" { class: head }
+a: "Server sends text,\nimages and flags.\nLayout compiled in" { class: a }
+b: "Server picks and\norders components\nfrom the catalog" { class: b }
+c: "Server composes\nrows, columns,\ntext and images" { class: c }
+d: "Server sends a\nscript or bundle\nthe app executes" { class: d }
+```
+
+Most production systems sit in the second column, and this chapter describes that one. The third column gives the server more freedom and moves design-system decisions out of the app. The fourth is over-the-air updates for React Native or a WebView, and it is the column the store rules are about.
+
+1. **Ship a catalog.** The app contains a fixed set of components built with its normal UI toolkit: banner, product row, order list, and so on. Each has a name and a typed set of properties.
+2. **The server sends a tree of component descriptions.** Each node has a `type`, properties and optional actions. The response is data.
+3. **A registry maps `type` to a component.** Rendering a screen is a loop over the list.
+4. **Unknown types are skipped, or replaced by a fallback the server provides.** This rule is what lets old versions survive new responses.
+5. **The client states what it supports.** It sends its app version or a catalog version with every request, and the server composes a response that version can render.
+6. **Actions are data too.** A tap carries a description such as "navigate to this route" or "add this item to the cart", which a dispatcher in the app executes. Routes reuse the app's deep links ([navigation](/core-patterns/navigation/)).
+7. **Cache the last good response.** The screen draws from the cache at launch and refreshes in the background.
+8. **Write the schema down.** A GraphQL schema, protobuf definitions or JSON Schema is the contract, and both the server and each client generate or validate their types from it.
+
+A response for the home screen:
+
+```json
+{
+  "screen": "home",
+  "sections": [
+    { "type": "banner", "id": "sale", "title": "Sale ends Sunday", "imageUrl": "https://cdn.example.com/sale.jpg",
+      "action": { "type": "navigate", "route": "shop://campaign/autumn" } },
+    { "type": "productRow", "id": "picks", "title": "Picked for you", "productIds": ["p1", "p7", "p9"] },
+    { "type": "countdown", "id": "timer", "endsAt": "2026-11-22T23:00:00Z",
+      "fallback": { "type": "banner", "id": "timer-fallback", "title": "Sale ends Sunday" } }
+  ]
+}
+```
+
+```d2
+classes: {
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App 4.2\n(catalog v7)" { class: app }
+bff: "Screen service" { class: srv }
+app -> app: "draw cached screen" { style.font-size: 16 }
+app -> bff: "GET /screens/home\nX-Catalog-Version: 7" { style.font-size: 16 }
+bff -> bff: "countdown needs v8:\nsend its fallback" { style.font-size: 16 }
+bff -> app: "sections: banner,\nproductRow, banner" { style.font-size: 16 }
+app -> app: "map types to components,\nskip unknown" { style.font-size: 16 }
+app -> app: "tap: dispatch the action" { style.font-size: 16 }
+```
+
+## Decoding and rendering sections in each stack
+
+Each sample decodes the `sections` array into typed values, turns an unknown `type` into a value the renderer skips, and maps the rest to components.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Serializable(with = SectionSerializer::class)
+sealed interface Section {
+    @Serializable data class Banner(val id: String, val title: String, val imageUrl: String? = null) : Section
+    @Serializable data class ProductRow(val id: String, val title: String, val productIds: List<String>) : Section
+    @Serializable data object Unknown : Section
+}
+
+object SectionSerializer : JsonContentPolymorphicSerializer<Section>(Section::class) {
+    override fun selectDeserializer(element: JsonElement) =
+        when (element.jsonObject["type"]?.jsonPrimitive?.content) {
+            "banner" -> Section.Banner.serializer()
+            "productRow" -> Section.ProductRow.serializer()
+            else -> Section.Unknown.serializer()
+        }
+}
+
+@Composable
+fun SectionList(sections: List<Section>) {
+    LazyColumn {
+        items(sections) { section ->
+            when (section) {
+                is Section.Banner -> BannerCard(section)
+                is Section.ProductRow -> ProductRowView(section)
+                Section.Unknown -> Unit
+            }
+        }
+    }
+}
+```
+`JsonContentPolymorphicSerializer` chooses a deserializer by looking at the JSON, so an unknown `type` becomes `Unknown` instead of an exception ([API reference](https://kotlinlang.org/api/kotlinx.serialization/kotlinx-serialization-json/kotlinx.serialization.json/-json-content-polymorphic-serializer/)). Decode with `Json { ignoreUnknownKeys = true }` so new properties on a known section are ignored. The `when` over a sealed interface is exhaustive: adding a section type to the catalog is a compile error until the renderer handles it. Jetpack's Remote Compose (alpha) solves a related problem, drawing Compose-style UI in another process for app widgets and Wear OS, and is not a server-driven UI system for app screens ([Remote Compose](https://developer.android.com/develop/ui/compose/system/remote-compose)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+enum Section: Decodable, Identifiable {
+    case banner(Banner)
+    case productRow(ProductRow)
+    case unknown(id: String)
+
+    var id: String {
+        switch self {
+        case .banner(let banner): banner.id
+        case .productRow(let row): row.id
+        case .unknown(let id): id
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case type, id }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+        switch type {
+        case "banner": self = .banner(try Banner(from: decoder))
+        case "productRow": self = .productRow(try ProductRow(from: decoder))
+        default: self = .unknown(id: (try? container.decode(String.self, forKey: .id)) ?? UUID().uuidString)
+        }
+    }
+}
+
+struct SectionList: View {
+    let sections: [Section]
+    var body: some View {
+        List(sections) { section in
+            switch section {
+            case .banner(let banner): BannerCard(banner: banner)
+            case .productRow(let row): ProductRowView(row: row)
+            case .unknown: EmptyView()
+            }
+        }
+    }
+}
+```
+A Swift enum with associated values models the catalog, and a custom `init(from:)` reads `type` first and then decodes the matching struct from the same decoder ([encoding and decoding custom types](https://developer.apple.com/documentation/foundation/encoding-and-decoding-custom-types)). `Codable` ignores JSON keys a struct does not declare, so new properties are harmless. The `switch` is exhaustive, as on Android.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+const Banner = z.object({ type: z.literal('banner'), id: z.string(), title: z.string(), imageUrl: z.string().optional() });
+const ProductRow = z.object({ type: z.literal('productRow'), id: z.string(), title: z.string(), productIds: z.array(z.string()) });
+const Known = z.discriminatedUnion('type', [Banner, ProductRow]);
+type Section = z.infer<typeof Known>;
+
+export function parseSections(raw: unknown[]): Section[] {
+  return raw.flatMap((item) => {
+    const result = Known.safeParse(item);
+    return result.success ? [result.data] : [];   // unknown or malformed: skip
+  });
+}
+
+export function SectionList({ sections }: { sections: Section[] }) {
+  return (
+    <FlatList
+      data={sections}
+      keyExtractor={(s) => s.id}
+      renderItem={({ item }) => {
+        switch (item.type) {
+          case 'banner': return <BannerCard {...item} />;
+          case 'productRow': return <ProductRowView {...item} />;
+        }
+      }}
+    />
+  );
+}
+```
+A zod discriminated union validates each section at runtime and gives TypeScript the narrowed types ([zod: discriminated unions](https://zod.dev/api#discriminated-unions)). `safeParse` per item means one bad section does not discard the screen. React Native can also replace the JavaScript that renders the screen with an over-the-air update ([releases](/shipping/releases/#a-staged-rollout-in-each-stack)). The two tools differ: an update changes code for one runtime version and is rolled out, and a server-driven response changes one screen per request and can differ per user.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+sealed class Section {
+  const Section();
+
+  factory Section.fromJson(Map<String, dynamic> json) => switch (json['type']) {
+        'banner' => Banner(id: json['id'], title: json['title'], imageUrl: json['imageUrl']),
+        'productRow' => ProductRow(
+            id: json['id'], title: json['title'], productIds: List<String>.from(json['productIds'])),
+        _ => const UnknownSection(),
+      };
+}
+
+class SectionList extends StatelessWidget {
+  const SectionList({super.key, required this.sections});
+  final List<Section> sections;
+
+  @override
+  Widget build(BuildContext context) => ListView.builder(
+        itemCount: sections.length,
+        itemBuilder: (context, i) => switch (sections[i]) {
+          Banner b => BannerCard(banner: b),
+          ProductRow r => ProductRowView(row: r),
+          UnknownSection() => const SizedBox.shrink(),
+        },
+      );
+}
+```
+`Banner`, `ProductRow` and `UnknownSection` extend `Section`. Dart's sealed classes make both `switch` expressions exhaustive ([class modifiers: sealed](https://dart.dev/language/class-modifiers#sealed)). Wrap the factory in a `try` in production so a section with a missing field is skipped. The Flutter team's `rfw` package (Remote Flutter Widgets, 2.0) sits in the "layout primitives" column: it renders widget descriptions fetched at runtime from a library of widgets the app registers ([rfw](https://pub.dev/packages/rfw)). Nubank runs its Flutter app largely on a server-driven system of its own ([Backend Driven Content](https://building.nu.com/server-driven-ui-framework-at-nubank/)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: models, decoding and caching are shared
+class ScreenRepository(private val http: HttpClient, private val cache: ScreenCache) {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    fun home(): Flow<List<Section>> = flow {
+        cache.read("home")?.let { emit(decode(it)) }           // cached screen first
+        val fresh = http.get("screens/home") {
+            header("X-Catalog-Version", CATALOG_VERSION)
+        }.bodyAsText()
+        cache.write("home", fresh)
+        emit(decode(fresh))
+    }
+
+    private fun decode(body: String): List<Section> =
+        json.decodeFromString<ScreenResponse>(body).sections.filter { it !is Section.Unknown }
+}
+```
+The `Section` model and its serializer from the Android tab compile unchanged in `commonMain`, since kotlinx.serialization is multiplatform. Decoding, the unknown-type rule, the catalog version header and the cache then exist once. With Compose Multiplatform the renderer is shared as well. With native UI, SwiftUI switches over the sealed hierarchy, which is easier to do exhaustively with Swift export or SKIE ([native interop](/architecture/native-interop/#kotlin-seen-from-swift)).
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+A server-driven screen can be broken by a backend deploy, for every app version at once, with no release to halt. Validate each response against the schema before it leaves the server, keep contract tests that render recorded responses in every supported app version, and put the screen service behind the same staged rollout and monitoring as a client release ([observability](/shipping/observability/)).
+</Aside>
+
+## Versioning the catalog
+
+| Change | Old clients | Rule |
+| --- | --- | --- |
+| New optional property on a known section | Ignore it | Always safe |
+| New section type | Skip it, or render its `fallback` | Safe if the screen makes sense without it |
+| New required property | Fail to decode that section | Add a new type instead |
+| Changed meaning of a property | Render it wrongly | Never do this. Add a property |
+| New action type | Tap does nothing | Send a fallback action, or hide the element for old catalogs |
+| Removed section type | Unaffected | Remove from the server first, from clients later |
+
+Lyft's engineers describe the same problem as "capabilities": which components each client version supports, declared by the client and respected by the server ([The Journey to Server Driven UI at Lyft Bikes and Scooters](https://eng.lyft.com/the-journey-to-server-driven-ui-at-lyft-bikes-and-scooters-c19264a0378e)). A single catalog version number is the simplest form. A list of supported types is more precise and makes requests larger.
+
+## Existing systems
+
+| System | Kind | Notes |
+| --- | --- | --- |
+| Airbnb Ghost Platform | Sections, screens and actions over a GraphQL schema | Shared by web, iOS and Android ([deep dive](https://medium.com/airbnb-engineering/a-deep-dive-into-airbnbs-server-driven-ui-system-842244c5f5)) |
+| DivKit | Open-source layout primitives with clients for Android, iOS and web | From Yandex ([repository](https://github.com/divkit/divkit)) |
+| `rfw` | Layout primitives for Flutter | Maintained by the Flutter team |
+| A2UI | A protocol for AI agents to describe UI from a client's catalog | Version 0.9.1 is the production release, 1.0 is a candidate ([specification](https://a2ui.org/specification/v1.0-a2ui/)) |
+
+A2UI applies the same pattern to a different author. An agent, in place of a screen service, emits component descriptions, and the client renders only what its catalog contains. The safety argument is identical: the response is data, checked against a catalog the app shipped with.
+
+## Trade-offs and scale
+
+**Use it for a few screens.** Home, campaign pages, onboarding and settings menus change often and are mostly lists of cards. A checkout flow, an editor or a camera screen has interaction logic that does not fit a list of sections. Most large apps are a mix.
+
+**A design system comes first.** The catalog is a list of well-defined components with fixed properties. Without that, each team asks for one more property until `banner` has forty.
+
+**Logic moves to the server.** Which sections a user sees, in which language and which experiment arm, is decided once for all platforms. That removes the "countdown ends an hour apart" bug. It also means the backend team now owns part of the mobile experience and needs mobile engineers in its reviews.
+
+**Testing multiplies.** The matrix is response versions times app versions. Record real responses, replay them against each supported app version in CI, and snapshot the result ([testing strategy](/shipping/testing/)).
+
+**Debugging gets harder.** A layout bug may be in the response, the decoder or the component. Log the response identifier with crashes, and build a debug screen that shows the raw tree.
+
+**Performance.** Decoding and a generic renderer add work at the moment the screen opens. Use the lazy list of your toolkit, give every section a stable `id`, and preload images named in the cached response ([performance](/shipping/performance/)).
+
+**Offline and first launch.** Bundle a default response in the app for the first launch, and decide how old a cached screen may be before the app shows a placeholder.
+
+**Accessibility and localization.** The server sends user-visible strings, so it must send them in the user's language and include labels for images and actions ([localization and accessibility](/core-patterns/localization-accessibility/)).
+
+**Store review.** Arranging components the reviewed app already contains is content. A response that unlocks a feature review never saw is the hidden-feature problem described under [feature flags](/shipping/feature-flags/#trade-offs-and-scale).
+
+<NoDumbQuestions>
+<dt>Is a WebView the simplest server-driven UI?</dt>
+<dd>For a help page or terms of service, yes. For a main screen it brings web scrolling, web navigation and its own loading states into a native app. Server-driven sections keep the native components.</dd>
+
+<dt>Should the server send colours, padding and font sizes?</dt>
+<dd>Send design tokens such as "emphasis: high" and let the component decide. Raw values turn the response into a second, weaker layout language and break dark mode and dynamic type.</dd>
+
+<dt>GraphQL, protobuf or JSON?</dt>
+<dd>Any of them works. GraphQL and protobuf give generated types and explicit union types. Plain JSON needs a schema file and validation on both ends to reach the same safety.</dd>
+
+<dt>Can server-driven screens be A/B tested?</dt>
+<dd>Yes, and more easily than compiled ones: the server assigns the arm and sends the matching sections. Log the exposure from the client when a section is drawn ([experiments](/shipping/feature-flags/#experiments)).</dd>
+
+<dt>Does this replace releases?</dt>
+<dd>No. New components, new action types and bug fixes in components still ship in the binary. Server-driven UI changes what the existing catalog shows.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Catalog model | Sealed interface | Enum with associated values | Discriminated union | Sealed class | Sealed interface in `commonMain` |
+| Decode by `type` | `JsonContentPolymorphicSerializer` | Custom `init(from:)` | `z.discriminatedUnion` | `switch` in a factory | Same as Android |
+| Ignore new properties | `ignoreUnknownKeys = true` | Default in `Codable` | Default in `z.object` | Default with manual parsing | Same as Android |
+| Exhaustive rendering | `when` | `switch` | `switch` on `type` | `switch` expression | `when` |
+| Lazy section list | `LazyColumn` | `List`, `LazyVStack` | `FlatList`, FlashList | `ListView.builder` | `LazyColumn` |
+| Action to navigation | Deep link into Navigation 3 | `NavigationPath`, `openURL` | Expo Router `router.push` | go_router `context.go` | Shared route, platform navigation |
+| Change code remotely | No | No | Expo Update | Shorebird | No |
+
+<Exercise>
+Your catalog is at version 7 with `banner`, `productRow` and `orderList`. Product wants a `countdown` section on the home screen next week for the sale. Versions 4.0 to 4.2 of the app are in use, and a 4.3 release with new components could leave in three days. Plan the change so every user sees something sensible on the day of the sale.
+
+<Fragment slot="answer">
+1. Add `countdown` to the schema as a new section type with `endsAt` and a `fallback` section.
+2. Implement the component on each platform, bump the catalog version to 8, and ship it in 4.3. Compute the remaining time from `endsAt` and the device clock, so both platforms end at the same instant.
+3. On the server, compose by catalog version: clients sending 8 get `countdown`, clients sending 7 or lower get the fallback `banner` with the text "Sale ends Sunday".
+4. Before the sale, replay the new response against 4.0, 4.1 and 4.2 in CI and check that each renders the fallback and that 4.3 renders the countdown.
+5. Roll the screen service change out in stages and watch decode failures and the home screen's error rate per app version.
+6. When the sale ends, remove the section from the response. No release is needed, and the component stays in the catalog for next time.
+
+If 4.3 slips, nothing breaks: every client gets the banner. That independence from the release date is what the fallback rule buys.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** apps decode sections with `System.Text.Json` polymorphism and map them to views in the same way.
+- **Ionic / Capacitor** apps are web apps, so the web layer can be updated like a website, within the same store rules as other over-the-air updates.
+- **Lynx** loads its UI bundles through the host app, which makes remotely delivered screens its normal mode.
+
+## Sources
+
+- Store rules: [App Review Guidelines 2.5.2](https://developer.apple.com/app-store/review/guidelines/#software-requirements), [Google Play: device and network abuse](https://support.google.com/googleplay/android-developer/answer/16559646)
+- Android: [JsonContentPolymorphicSerializer](https://kotlinlang.org/api/kotlinx.serialization/kotlinx-serialization-json/kotlinx.serialization.json/-json-content-polymorphic-serializer/), [Remote Compose concepts and architecture](https://developer.android.com/develop/ui/compose/system/remote-compose), [Remote Compose releases](https://developer.android.com/jetpack/androidx/releases/compose-remote) (1.0.0-alpha23)
+- iOS: [Encoding and decoding custom types](https://developer.apple.com/documentation/foundation/encoding-and-decoding-custom-types)
+- React Native: [zod: discriminated unions](https://zod.dev/api#discriminated-unions)
+- Flutter: [Class modifiers: sealed](https://dart.dev/language/class-modifiers#sealed), [rfw](https://pub.dev/packages/rfw) (2.0)
+- Systems: [A deep dive into Airbnb's server-driven UI system](https://medium.com/airbnb-engineering/a-deep-dive-into-airbnbs-server-driven-ui-system-842244c5f5), [The Journey to Server Driven UI at Lyft Bikes and Scooters](https://eng.lyft.com/the-journey-to-server-driven-ui-at-lyft-bikes-and-scooters-c19264a0378e) (2023), [Nubank: Backend Driven Content](https://building.nu.com/server-driven-ui-framework-at-nubank/), [DivKit](https://github.com/divkit/divkit), [A2UI specification](https://a2ui.org/specification/v1.0-a2ui/)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 29 (web, PWA and backend-driven mobile apps)
