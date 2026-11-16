@@ -1,0 +1,121 @@
+---
+title: iOS toolkit
+description: What to install, how an Xcode project is laid out, the frameworks and libraries a Swift and SwiftUI codebase is expected to use, and the daily workflow from Xcode to TestFlight.
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+iOS development is Swift and SwiftUI inside Xcode, on a Mac. Apple ships most of what an app needs as system frameworks, so an iOS project typically has far fewer third-party dependencies than the other stacks in this book. Apple publishes no architecture guide comparable to Android's, so structure is a team decision.
+
+## Install
+
+| Tool | What it is for |
+| --- | --- |
+| A Mac | Xcode runs only on macOS. Xcode 27 requires an Apple silicon Mac ([Xcode system requirements](https://developer.apple.com/xcode/system-requirements/)). |
+| [Xcode](https://developer.apple.com/xcode/) | The IDE, the Swift compiler, the SDKs, Simulator, Instruments and the command-line tools. Install it from the Mac App Store or the developer downloads page. |
+| Simulator runtimes | Downloaded per platform on first launch or from Settings > Components. |
+| Apple Account | A free account can run an app on your own device. Distributing through TestFlight or the App Store requires membership in the Apple Developer Program ([program membership](https://developer.apple.com/programs/)). |
+
+A released Xcode version includes one Swift version, and the App Store sets a minimum Xcode version for uploads each year ([upcoming requirements](https://developer.apple.com/news/upcoming-requirements/)). Teams therefore upgrade Xcode together.
+
+## Create and run a project
+
+In Xcode, choose **File > New > Project**, pick the **App** template with SwiftUI, select a simulator in the toolbar and press Run.
+
+From a terminal:
+
+```sh
+xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 17' build
+xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 17' test
+xcrun simctl list devices          # available simulators
+xcrun simctl openurl booted "https://example.com/orders/42"
+```
+
+## Project layout
+
+```
+MyApp/
+  MyApp.xcodeproj            project file: targets, build settings, schemes
+  MyApp/
+    MyAppApp.swift           @main entry point with the App struct
+    ContentView.swift        first view
+    Assets.xcassets          images, colours, app icon
+    Localizable.xcstrings    String Catalog
+    Info.plist               declared capabilities and usage descriptions
+    MyApp.entitlements       associated domains, push, iCloud
+  MyAppTests/                unit tests
+  MyAppUITests/              UI tests
+  Packages/                  local Swift packages, once you modularize
+```
+
+Terms you meet at once: a **target** produces one product (the app, a test bundle, a widget extension). A **scheme** says which targets to build and how to run or test them. A **build configuration** (Debug, Release) is a set of build settings. The **bundle identifier** identifies the app to the system and the store.
+
+The **deployment target** is the oldest iOS version you support. It decides which APIs you can use without availability checks, so it is the iOS counterpart of `minSdk`.
+
+## Default stack
+
+"System" means it ships with the OS and needs no dependency. "Common" means a third-party library found in many production codebases.
+
+| Concern | Default | Status | Also seen |
+| --- | --- | --- | --- |
+| UI | SwiftUI ([SwiftUI](https://developer.apple.com/documentation/swiftui)) | System | UIKit for older screens and fine control |
+| State | `@Observable`, `@State`, `@Environment` | System | The Composable Architecture |
+| Async | Swift Concurrency (`async`/`await`, actors) | System | Combine, Grand Central Dispatch in older code |
+| Navigation | `NavigationStack` | System | Coordinators over UIKit |
+| Networking | `URLSession` | System | Alamofire |
+| JSON | `Codable` | System | |
+| Database | SwiftData | System | Core Data, GRDB |
+| Settings and secrets | `UserDefaults`, Keychain | System | |
+| Dependency injection | Initializers and the SwiftUI environment | System | Factory, swift-dependencies |
+| Background work | BackgroundTasks | System | |
+| Images from the network | `AsyncImage` | System | Kingfisher, Nuke for caching |
+| Push | APNs through UserNotifications | System | Firebase Cloud Messaging |
+| In-app purchases | StoreKit 2 | System | RevenueCat |
+| Crashes | Xcode Organizer, MetricKit | System | Firebase Crashlytics, Sentry |
+
+Apple's sample projects are the nearest thing to a reference app. [Landmarks](https://developer.apple.com/tutorials/swiftui) is the SwiftUI tutorial project, and each WWDC adds samples for new APIs.
+
+## Daily workflow
+
+- **See UI changes.** A `#Preview` block renders a view in the canvas next to the code and updates as you type ([previews in Xcode](https://developer.apple.com/documentation/swiftui/previews-in-xcode)).
+- **Debug.** Breakpoints with LLDB, the view hierarchy debugger and the memory graph debugger.
+- **Profile.** Instruments has templates for time profiling, allocations, hangs and SwiftUI updates ([Instruments](https://developer.apple.com/tutorials/instruments)).
+- **Unit test.** Swift Testing, with `@Test` functions and `#expect` assertions, is the framework for new tests (Xcode 16+). XCTest remains for UI and performance tests ([Swift Testing](https://developer.apple.com/documentation/testing)).
+- **UI test.** XCUITest drives the app through its accessibility tree ([XCUIAutomation](https://developer.apple.com/documentation/xcuiautomation)).
+- **Lint and format.** `swift format` ships with the toolchain since Xcode 16 ([swift-format](https://github.com/swiftlang/swift-format)). [SwiftLint](https://github.com/realm/SwiftLint) adds style and correctness rules.
+- **Concurrency checking.** New projects use the Swift 6 language mode, where data races are compile errors ([concurrency](/foundations/concurrency/)).
+
+## Dependencies
+
+Swift Package Manager is built into Xcode: **File > Add Package Dependencies** takes a Git URL, and `Package.resolved` records the exact versions ([adding package dependencies](https://developer.apple.com/documentation/xcode/adding-package-dependencies-to-your-app)). Commit that file.
+
+<Aside type="caution" title="Watch it!">
+CocoaPods was the standard dependency manager for a decade and is in maintenance mode. Its central repository becomes read-only on December 2, 2026, after which no new pods or versions can be published ([CocoaPods trunk read-only plan](https://blog.cocoapods.org/CocoaPods-Specs-Repo/)). Use Swift Package Manager for new work, and plan the migration for an existing `Podfile`.
+</Aside>
+
+## Build, sign and release
+
+1. **Configurations.** Debug and Release exist by default. Teams add configurations or schemes for staging servers, with settings kept in `.xcconfig` files.
+2. **Sign.** Every build that runs on a device is signed with a certificate and a provisioning profile that names the app, the devices and the capabilities. Xcode's automatic signing manages them for most apps ([distributing your app](https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases)).
+3. **Archive and upload.** **Product > Archive** builds a release, and the Organizer uploads it to App Store Connect.
+4. **Beta.** TestFlight distributes the build to internal testers at once and to external testers after a beta review ([TestFlight](https://developer.apple.com/testflight/)).
+5. **Review and release.** Every version goes through App Review. A phased release then rolls the update out to a growing share of users over seven days ([phased release](https://developer.apple.com/help/app-store-connect/update-your-app/release-a-version-update-in-phases/)).
+6. **Automate.** [Xcode Cloud](https://developer.apple.com/xcode-cloud/) is Apple's CI. Other CI systems run `xcodebuild` on macOS runners, often driven by [fastlane](https://docs.fastlane.tools/).
+
+## Practices to adopt from the start
+
+- Declare every permission's usage description in `Info.plist` before you request it. A missing string crashes the app at the moment of the request.
+- Add the privacy manifest and keep it accurate. App Review checks declared data use and required-reason APIs ([privacy manifest files](https://developer.apple.com/documentation/bundleresources/privacy-manifest-files)).
+- Move features into local Swift packages early. Packages give you access control between modules and faster incremental builds ([dependency injection and modularization](/core-patterns/dependency-injection/)).
+- Test on a real device before each release. The simulator runs on the Mac's CPU and has no thermal limits, cellular radio or real memory pressure.
+- Read crash and hang reports in the Xcode Organizer from the first TestFlight build.
+
+## Sources
+
+- Setup: [Xcode](https://developer.apple.com/xcode/), [Xcode system requirements](https://developer.apple.com/xcode/system-requirements/), [Apple Developer Program](https://developer.apple.com/programs/), [Upcoming requirements](https://developer.apple.com/news/upcoming-requirements/)
+- Frameworks: [SwiftUI](https://developer.apple.com/documentation/swiftui), [SwiftUI tutorials](https://developer.apple.com/tutorials/swiftui), [Swift Testing](https://developer.apple.com/documentation/testing), [XCUIAutomation](https://developer.apple.com/documentation/xcuiautomation), [Previews in Xcode](https://developer.apple.com/documentation/swiftui/previews-in-xcode)
+- Dependencies: [Adding package dependencies to your app](https://developer.apple.com/documentation/xcode/adding-package-dependencies-to-your-app), [CocoaPods trunk read-only plan](https://blog.cocoapods.org/CocoaPods-Specs-Repo/)
+- Tools: [swift-format](https://github.com/swiftlang/swift-format), [SwiftLint](https://github.com/realm/SwiftLint), [Instruments tutorials](https://developer.apple.com/tutorials/instruments), [fastlane](https://docs.fastlane.tools/)
+- Release: [Distributing your app for beta testing and releases](https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases), [TestFlight](https://developer.apple.com/testflight/), [Phased release](https://developer.apple.com/help/app-store-connect/update-your-app/release-a-version-update-in-phases/), [Xcode Cloud](https://developer.apple.com/xcode-cloud/), [Privacy manifest files](https://developer.apple.com/documentation/bundleresources/privacy-manifest-files)

@@ -24,5 +24,6 @@ A book-style docs site (Astro Starlight) comparing how Android, iOS, React Nativ
 - Baseline is November 2026 (see `start-here/how-to-read.mdx`). Mention older tech only where readers will still meet it.
 - Every factual claim about a framework links to official docs, release notes or a primary engineering post, with the version it applies to. Verify versions before writing; don't rely on memory.
 - Other stacks (.NET MAUI, Capacitor, Lynx) only as short sidebars.
+- Toolkit pages live in `src/content/docs/toolkits/`: an overview plus one page per stack, all with the same sections (install, create and run, project layout, default stack, daily workflow, dependencies, release, practices, sources). They are reference pages, so the chapter shape and Head First devices don't apply, but the sourcing and voice rules do. When a chapter changes a stack's default library, update the toolkit tables too.
 - Voice: second person, plain, concrete examples. Follow the `the-writing-whip` skill: sentence-case headings, no Wh-word headings, no em dashes, no filler transitions, straight quotes.
 - The Orosz book txt in the root is copyrighted reference material: gitignored, never quote it at length.

@@ -1,0 +1,113 @@
+---
+title: Toolkits at a glance
+description: The tools, default libraries and daily workflow of each stack side by side, so you can set up an unfamiliar one and know what a normal project looks like.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The chapters in this book explain patterns. These pages answer a more practical question: you sit down at a stack you have never used, and you need to know what to install, how to create a project, which libraries a team would expect to find in it, and what the working day looks like.
+
+There is one page per stack, all with the same sections:
+
+- [Android](/toolkits/android/)
+- [iOS](/toolkits/ios/)
+- [React Native](/toolkits/react-native/)
+- [Flutter](/toolkits/flutter/)
+- [KMP / CMP](/toolkits/kmp/)
+
+Versions follow the book's baseline of November 2026 ([how to read this book](/start-here/how-to-read/)). Library choices are the ones the official documentation uses or that most production codebases contain. Each page marks which is which.
+
+## The two loops
+
+Every stack has the same two loops. The inner loop is what you do hundreds of times a day, and its speed decides how the stack feels. The outer loop is how a change reaches users.
+
+```d2
+classes: {
+  inner: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  outer: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  store: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+innerloop: "Inner loop: seconds" {
+  style.font-size: 18
+  grid-columns: 3
+  grid-gap: 12
+  edit: "Edit" { class: inner }
+  reload: "Reload or preview" { class: inner }
+  check: "Unit test, lint" { class: inner }
+}
+outerloop: "Outer loop: minutes to days" {
+  style.font-size: 18
+  grid-columns: 4
+  grid-gap: 12
+  pr: "Pull request" { class: outer }
+  ci: "CI: build,\ntest, lint" { class: outer }
+  beta: "Signed build\nto testers" { class: outer }
+  release: "Store review,\nstaged rollout" { class: store }
+}
+innerloop -> outerloop: "commit" { style.font-size: 16 }
+```
+
+## Machine and editor
+
+| | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| OS you can develop on | macOS, Windows, Linux | macOS | macOS, Windows, Linux | macOS, Windows, Linux | macOS, Windows, Linux |
+| Building the iOS app needs | n/a | A Mac with Xcode | A Mac with Xcode, or a cloud build | A Mac with Xcode | A Mac with Xcode |
+| Editor | Android Studio | Xcode | VS Code or any JS editor | VS Code or Android Studio | IntelliJ IDEA or Android Studio |
+| Language | Kotlin | Swift | TypeScript | Dart | Kotlin (plus Swift for native iOS UI) |
+| Build system | Gradle | Xcode build system | Metro bundler over Gradle and Xcode | `flutter` tool over Gradle and Xcode | Gradle, plus Xcode for the iOS app |
+| Package manager | Gradle with a version catalog | Swift Package Manager | npm, pnpm, Yarn or Bun | pub | Gradle with a version catalog |
+| Create a project | Android Studio wizard | Xcode template | `npx create-expo-app` | `flutter create` | IDE wizard or kmp.jetbrains.com |
+| Environment check | SDK Manager | n/a | `npx expo-doctor` | `flutter doctor` | Preflight checks in the IDE plugin |
+
+Every cross-platform stack builds a native app in the end ([runtime anatomy](/foundations/runtime-anatomy/)), so React Native, Flutter and KMP developers install Android Studio and Xcode as well, even if they rarely open them.
+
+## Default libraries by concern
+
+One row per Level 1 chapter. The first name in a cell is what official guides use.
+
+| Concern | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| UI | Jetpack Compose, Material 3 | SwiftUI | React Native core components | Flutter widgets, Material | Compose Multiplatform |
+| [State](/core-patterns/state-management/) | `ViewModel` + `StateFlow` | `@Observable` | Zustand, TanStack Query | `ChangeNotifier`, Riverpod, Bloc | `ViewModel` + `StateFlow` |
+| [Navigation](/core-patterns/navigation/) | Navigation 3 | `NavigationStack` | Expo Router | go_router | Navigation 3 |
+| [Networking](/core-patterns/networking/) | Retrofit + OkHttp | `URLSession` | `fetch` | `http`, dio | Ktor Client |
+| JSON | kotlinx.serialization | `Codable` | zod | json_serializable | kotlinx.serialization |
+| [Database](/core-patterns/persistence/) | Room | SwiftData | expo-sqlite | drift | Room, SQLDelight |
+| Settings | DataStore | `UserDefaults` | MMKV | shared_preferences | DataStore |
+| [Dependency injection](/core-patterns/dependency-injection/) | Hilt | Initializers, environment | Context, module imports | Riverpod, provider, get_it | Koin, Metro |
+| [Background work](/core-patterns/background-work/) | WorkManager | BackgroundTasks | expo-background-task | workmanager | Native per platform |
+| Push | Firebase Cloud Messaging | APNs | expo-notifications | firebase_messaging | Native per platform |
+| [Strings](/core-patterns/localization-accessibility/) | `strings.xml` | String Catalogs | i18next | gen-l10n with ARB | Compose resources |
+| Images | Coil | `AsyncImage`, Kingfisher, Nuke | expo-image | `Image.network`, cached_network_image | Coil |
+
+## Quality and release tools
+
+| | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Fast UI feedback | Compose Preview, Live Edit | Xcode Previews | Fast Refresh | Hot reload | Compose Preview, Compose Hot Reload |
+| Unit tests | JUnit, coroutines-test, Turbine | Swift Testing | Jest | `flutter test` | kotlin.test |
+| UI tests | Compose UI test | XCUITest | React Native Testing Library, Maestro | Widget tests, integration_test | Compose UI test |
+| Lint | Android Lint, detekt | SwiftLint | ESLint, TypeScript | `flutter analyze` | detekt |
+| Formatter | ktlint, ktfmt | swift-format | Prettier | `dart format` | ktlint, ktfmt |
+| Debugger and profiler | Android Studio profilers | Instruments | React Native DevTools | Flutter DevTools | Android Studio and Xcode |
+| Beta distribution | Play internal testing, Firebase App Distribution | TestFlight | Expo Build, then the same two | The same two | The same two |
+| Store artifact | Android App Bundle | Archive uploaded to App Store Connect | Both | Both | Both |
+| Update without the store | No | No | Expo Update for JavaScript | Shorebird (third party) | No |
+| Crash reporting | Firebase Crashlytics, Sentry | Xcode Organizer, Crashlytics, Sentry | Sentry, Crashlytics | Crashlytics, Sentry | Crashlytics, Sentry |
+
+## Practices that hold in every stack
+
+- **Pin the toolchain.** Commit the files that fix versions: the Gradle wrapper and version catalog, `Package.resolved`, the JavaScript lockfile, `pubspec.lock`. Use the same versions in CI.
+- **Format and lint in CI from the first commit.** Adding a formatter to a large codebase produces one enormous diff. Adding it on day one costs nothing.
+- **Keep secrets out of the repository.** Signing keys, API keys and service account files belong in the CI secret store. An API key compiled into the app can be extracted, so anything that must stay secret belongs on your server.
+- **Automate the signed build early.** The first store upload always surfaces signing, icon and metadata problems. Do it in the first week with an empty app.
+- **Test on a slow device.** Simulators and flagship phones hide performance problems. Keep one old, cheap Android phone on the desk.
+- **Follow the official sample.** Each stack has a reference app maintained by its vendor, linked on each page. When unsure how to structure something, copy it.
+
+<Aside type="caution" title="Watch it!">
+Library popularity changes faster than the patterns do. The tables here were checked in November 2026. Before adding a dependency, check its last release date and whether it supports the current version of its platform.
+</Aside>

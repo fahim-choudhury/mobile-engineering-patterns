@@ -1,0 +1,118 @@
+---
+title: React Native toolkit
+description: What to install, how an Expo project is laid out, the libraries a TypeScript and React Native codebase is expected to use, and the daily workflow from Fast Refresh to EAS.
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+React Native development is TypeScript and React, with a framework on top that handles routing, native builds and releases. The React Native documentation recommends starting with a framework and names Expo ([get started with React Native](https://reactnative.dev/docs/environment-setup)). This page assumes Expo. React Native itself ships few libraries, so most rows in the default stack are community packages.
+
+## Install
+
+| Tool | What it is for |
+| --- | --- |
+| [Node.js](https://nodejs.org/) LTS | Runs the CLI, the Metro bundler and your tests. |
+| A package manager | npm ships with Node. pnpm, Yarn and Bun also work with Expo. |
+| VS Code or another editor | Any editor with TypeScript support. |
+| Android Studio | For the Android SDK and emulator ([Android setup](https://docs.expo.dev/workflow/android-studio-emulator/)). |
+| Xcode, on a Mac | For the iOS simulator and local iOS builds ([iOS setup](https://docs.expo.dev/workflow/ios-simulator/)). |
+
+Without a Mac you can still ship to iOS: Expo Build compiles and signs the iOS app on Expo's servers, and you test on a physical iPhone ([Expo Build](https://docs.expo.dev/build/introduction/)).
+
+## Create and run a project
+
+```sh
+npx create-expo-app@latest my-app
+cd my-app
+npx expo run:android      # build and install a development build
+npx expo run:ios
+npx expo start            # start the Metro dev server afterwards
+npx expo-doctor           # check the project for known problems
+```
+
+There are two ways to run the JavaScript during development. **Expo Go** is a prebuilt app from the stores that loads your project, useful for a first look and limited to the native modules it already contains. A **development build** is your own app in debug mode with the developer menu included, and it can contain any native library. Expo's documentation recommends development builds for real projects ([develop an app with Expo](https://docs.expo.dev/workflow/overview/)).
+
+## Project layout
+
+```
+my-app/
+  app.json                 app config: name, icons, bundle IDs, plugins
+  package.json             dependencies and scripts
+  tsconfig.json
+  app/                     routes: one file per screen
+    _layout.tsx            root layout (stack, tabs, providers)
+    index.tsx              the / route
+  components/              shared UI
+  assets/                  images and fonts
+  android/  ios/           generated native projects (often gitignored)
+```
+
+The `android` and `ios` directories are generated from `app.json` by `npx expo prebuild`. Expo calls this Continuous Native Generation: you describe native configuration in the app config and in config plugins, and regenerate the native projects when it changes ([continuous native generation](https://docs.expo.dev/workflow/continuous-native-generation/)). Teams that edit native code by hand commit those directories instead.
+
+The current Expo SDK is 58 (October 2026), which includes React Native 0.88 and React 19.3 ([Expo SDK 58](https://expo.dev/changelog/sdk-58)). Each Expo SDK supports one React Native version, so the two are upgraded together.
+
+## Default stack
+
+"Official" means the React Native or Expo documentation uses it. "Common" means a community library found in many production codebases.
+
+| Concern | Default | Status | Also seen |
+| --- | --- | --- | --- |
+| Language | TypeScript | Official | |
+| JavaScript engine | Hermes ([Hermes](https://reactnative.dev/docs/hermes)) | Official | |
+| Navigation | Expo Router | Official | React Navigation used directly |
+| Local and app state | `useState`, `useReducer`, Zustand | Common | Redux Toolkit, Jotai |
+| Server state | TanStack Query | Common | Apollo Client for GraphQL, RTK Query |
+| Networking | `fetch` | Official | axios |
+| Validation | zod | Common | |
+| Database | expo-sqlite, with Drizzle ORM | Official | WatermelonDB, op-sqlite |
+| Settings and secrets | react-native-mmkv, expo-secure-store | Common | AsyncStorage |
+| Lists | `FlatList`, [FlashList](https://shopify.github.io/flash-list/) | Official, Common | Shopify is looking for a new long-term maintainer for FlashList and keeps fixing critical issues until then ([September 2026](https://shopify.engineering/back-to-native)) |
+| Animation and gestures | [Reanimated](https://docs.swmansion.com/react-native-reanimated/), [Gesture Handler](https://docs.swmansion.com/react-native-gesture-handler/) | Common | |
+| Images | expo-image | Official | |
+| Forms | React Hook Form | Common | |
+| Styling | `StyleSheet` | Official | NativeWind, Unistyles |
+| Push | expo-notifications | Official | Firebase Messaging |
+| Strings | i18next with expo-localization | Common | Lingui |
+| Crashes | Sentry | Common | Firebase Crashlytics |
+
+Install libraries that contain native code with `npx expo install <name>`. It picks the version that matches your Expo SDK, where `npm install` would take the latest ([install libraries](https://docs.expo.dev/workflow/using-libraries/)). The [React Native Directory](https://reactnative.directory/) lists libraries with their platform and New Architecture support.
+
+## Daily workflow
+
+- **See changes.** Fast Refresh applies a saved file to the running app in about a second and keeps component state ([Fast Refresh](https://reactnative.dev/docs/fast-refresh)). A change to native code or the app config needs a rebuild.
+- **Debug.** Press `j` in the dev server terminal to open React Native DevTools, with a console, breakpoints, the component tree and a profiler ([React Native DevTools](https://reactnative.dev/docs/react-native-devtools)).
+- **Unit and component test.** Jest with the `jest-expo` preset runs tests in Node. React Native Testing Library renders components and queries them by role and text ([unit testing with Jest](https://docs.expo.dev/develop/unit-testing/)).
+- **End-to-end test.** [Maestro](https://docs.maestro.dev/) runs YAML flows against a real build, and Expo documents running it in Expo Workflows ([E2E tests on Expo Workflows](https://docs.expo.dev/eas/workflows/examples/e2e-tests/)). Detox is the older alternative.
+- **Lint, format, type-check.** `npx expo lint` sets up and runs ESLint. Prettier formats. `npx tsc --noEmit` type-checks, and CI should run all three.
+- **Memoization.** The React Compiler memoizes components at build time, so new code rarely needs `useMemo` or `useCallback` ([React Compiler](https://react.dev/learn/react-compiler)).
+
+## Build, sign and release
+
+Expo's hosted services are driven by the `eas` command-line tool. Older material calls them EAS Build, EAS Update and EAS Workflows, and the current documentation calls them Expo Build, Expo Update and Expo Workflows.
+
+1. **Profiles.** `eas.json` defines build profiles, typically `development`, `preview` and `production`, each with its own environment variables ([configure Expo Build](https://docs.expo.dev/build/eas-json/)).
+2. **Build and sign.** `eas build` produces the Android App Bundle and the iOS archive, and manages signing credentials for you. The same builds can run locally or on your own CI.
+3. **Submit.** `eas submit` uploads to Play Console and App Store Connect ([Submit to app stores](https://docs.expo.dev/submit/introduction/)). From there the store steps are the same as for a native app: test tracks and TestFlight, review, staged rollout.
+4. **Update over the air.** `eas update` publishes a new JavaScript bundle and assets to installed apps without a store release ([Expo Update](https://docs.expo.dev/eas-update/introduction/)). An update can change JavaScript only. Anything that changes native code needs a new build, and a runtime version ties each update to the builds it is compatible with.
+5. **Automate.** Expo Workflows runs builds, tests, submissions and updates from YAML files in the repository ([Expo Workflows](https://docs.expo.dev/eas/workflows/get-started/)).
+
+<Aside type="caution" title="Watch it!">
+An over-the-air update skips store review and reaches every user quickly. Roll updates out to a percentage first, and keep the previous update ready to republish. An update that crashes on launch for a native build it was not tested against is the most common way teams break production with this tool.
+</Aside>
+
+## Practices to adopt from the start
+
+- Use a development build from the first week, so adding a native library never forces a workflow change.
+- Keep native configuration in `app.json` and config plugins. Hand edits inside `android/` and `ios/` are lost at the next prebuild.
+- Upgrade one Expo SDK at a time, soon after each release. Skipping several makes the upgrade a project.
+- Run the release build on a low-end Android phone. Development mode is much slower than production, and a recent iPhone hides JavaScript thread problems ([concurrency](/foundations/concurrency/)).
+- Check that a library supports the New Architecture before adding it. Since React Native 0.82 the New Architecture is the only one available, so a native library that was never migrated may not work ([React Native 0.82](https://reactnative.dev/blog/2025/10/08/react-native-0.82)).
+
+## Sources
+
+- Setup: [Get started with React Native](https://reactnative.dev/docs/environment-setup), [Create a project with Expo](https://docs.expo.dev/get-started/create-a-project/), [Develop an app with Expo](https://docs.expo.dev/workflow/overview/), [Continuous native generation](https://docs.expo.dev/workflow/continuous-native-generation/), [Install libraries](https://docs.expo.dev/workflow/using-libraries/), [Expo SDK 58](https://expo.dev/changelog/sdk-58), [React Native 0.88](https://reactnative.dev/blog/2026/10/19/react-native-0.88)
+- Libraries: [React Native Directory](https://reactnative.directory/), [Hermes](https://reactnative.dev/docs/hermes), [FlashList](https://shopify.github.io/flash-list/), [Reanimated](https://docs.swmansion.com/react-native-reanimated/), [Gesture Handler](https://docs.swmansion.com/react-native-gesture-handler/), [React Compiler](https://react.dev/learn/react-compiler)
+- Workflow: [Fast Refresh](https://reactnative.dev/docs/fast-refresh), [React Native DevTools](https://reactnative.dev/docs/react-native-devtools), [Unit testing with Jest](https://docs.expo.dev/develop/unit-testing/), [Maestro](https://docs.maestro.dev/), [E2E tests on Expo Workflows](https://docs.expo.dev/eas/workflows/examples/e2e-tests/)
+- Release: [Expo Build](https://docs.expo.dev/build/introduction/), [Configure Expo Build](https://docs.expo.dev/build/eas-json/), [Submit to app stores](https://docs.expo.dev/submit/introduction/), [Expo Update](https://docs.expo.dev/eas-update/introduction/), [Expo Workflows](https://docs.expo.dev/eas/workflows/get-started/)

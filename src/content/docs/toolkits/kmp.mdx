@@ -1,0 +1,121 @@
+---
+title: KMP / CMP toolkit
+description: What to install, how a Kotlin Multiplatform project is laid out, the multiplatform libraries a shared Kotlin codebase is expected to use, and the daily workflow across Gradle and Xcode.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Kotlin Multiplatform (KMP) shares Kotlin code between an Android app and an iOS app. Compose Multiplatform (CMP) adds a shared UI on top. A KMP project is an Android project and an iOS project that both depend on shared Kotlin modules, so this page builds on the [Android toolkit](/toolkits/android/) and the [iOS toolkit](/toolkits/ios/).
+
+Decide one thing before creating the project: whether the UI is shared (Compose Multiplatform on both platforms) or native (Compose on Android, SwiftUI on iOS, with shared logic underneath). The project wizard asks, and the libraries below differ slightly.
+
+## Install
+
+| Tool | What it is for |
+| --- | --- |
+| IntelliJ IDEA or Android Studio | Both are supported by JetBrains for KMP ([quickstart](https://kotlinlang.org/docs/multiplatform/quickstart.html)). |
+| Kotlin Multiplatform IDE plugin | Project wizard, run configurations for iOS, Compose previews in common code and environment checks. |
+| Android SDK | As for Android. |
+| Xcode, on a Mac | Needed to build and run the iOS app. Without a Mac you can develop the shared code and the Android app. |
+
+## Create and run a project
+
+Create a project from the IDE's **Kotlin Multiplatform** wizard or the web wizard at [kmp.jetbrains.com](https://kmp.jetbrains.com/). Run configurations for Android and iOS appear in the IDE toolbar.
+
+```sh
+./gradlew :androidApp:assembleDebug        # Android app
+./gradlew :shared:allTests                 # shared tests on every target
+./gradlew :shared:iosSimulatorArm64Test    # shared tests on the iOS simulator
+```
+
+Module names depend on the template. The iOS app is built from Xcode or the IDE, and its build runs a Gradle task that compiles the shared code into a framework.
+
+## Project layout
+
+```
+my-app/
+  gradle/libs.versions.toml     version catalog
+  shared/                       Kotlin Multiplatform module
+    build.gradle.kts            targets and source set dependencies
+    src/
+      commonMain/kotlin/        code for every platform
+      androidMain/kotlin/       Android implementations (actual)
+      iosMain/kotlin/           iOS implementations (actual)
+      commonTest/kotlin/        tests that run on every target
+  androidApp/                   Android application module
+  iosApp/                       Xcode project that embeds the shared framework
+```
+
+Code in `commonMain` can use only multiplatform libraries. When it needs something platform-specific, it declares an `expect` function or an interface, and each platform source set provides the `actual` implementation ([expected and actual declarations](https://kotlinlang.org/docs/multiplatform/multiplatform-expect-actual.html)).
+
+With Android Gradle plugin 9, the shared module uses the `com.android.kotlin.multiplatform.library` plugin and the Android application lives in its own module ([Android Gradle library plugin for KMP](https://developer.android.com/kotlin/multiplatform/plugin), [updating projects for AGP 9](https://blog.jetbrains.com/kotlin/2026/01/update-your-projects-for-agp9/)). Templates and tutorials from before 2026 combine both in one module.
+
+## Default stack
+
+"Official" means JetBrains or Google publishes it for KMP. "Common" means a community library found in many KMP codebases.
+
+| Concern | Default | Status | Also seen |
+| --- | --- | --- | --- |
+| Shared UI | Compose Multiplatform ([docs](https://kotlinlang.org/docs/multiplatform/compose-multiplatform.html)) | Official | Native UI per platform |
+| State | `ViewModel` + `StateFlow` in `commonMain` | Official | Decompose, MVIKotlin |
+| Async | kotlinx.coroutines | Official | |
+| Navigation | Navigation 3, Navigation Compose | Official | Decompose, Voyager |
+| Networking | Ktor Client | Official | |
+| JSON | kotlinx.serialization | Official | |
+| Database | Room | Official | SQLDelight |
+| Settings | DataStore | Official | multiplatform-settings |
+| Dependency injection | Koin | Common | Metro, kotlin-inject |
+| Dates and I/O | kotlinx-datetime, kotlinx-io | Official | Okio |
+| Images | [Coil 3](https://coil-kt.github.io/coil/) | Common | |
+| Resources and strings | Compose Multiplatform resources | Official | moko-resources |
+| Logging | [Kermit](https://kermit.touchlab.co/) | Common | Napier |
+| Swift interop helpers | [SKIE](https://skie.touchlab.co/) | Common | KMP-NativeCoroutines, Swift export |
+| Background work, push | Native APIs on each platform | n/a | |
+
+Google lists the Jetpack libraries that support KMP and their stability ([Kotlin Multiplatform on Android](https://developer.android.com/kotlin/multiplatform)). [klibs.io](https://klibs.io/) is JetBrains' search for multiplatform libraries, filtered by target.
+
+The reference projects are JetBrains' samples ([KMP samples](https://kotlinlang.org/docs/multiplatform/multiplatform-samples.html)).
+
+## Daily workflow
+
+- **See UI changes.** `@Preview` works in common code since Compose Multiplatform 1.10. Compose Hot Reload, stable and bundled since the same release, reloads UI changes into a running desktop (JVM) target, which is the fastest loop for shared UI ([Compose Multiplatform 1.10.0](https://blog.jetbrains.com/kotlin/2026/01/compose-multiplatform-1-10-0/)).
+- **Run on iOS.** The IDE plugin launches the iOS app on a simulator and debugs Kotlin code there. Swift code is edited and debugged in Xcode.
+- **Test.** `kotlin.test` in `commonTest` runs on the JVM and on iOS targets, with `kotlinx-coroutines-test` and Turbine as on Android ([test your multiplatform app](https://kotlinlang.org/docs/multiplatform/multiplatform-run-tests.html)). Compose Multiplatform has a common UI test API.
+- **Lint and format.** detekt and ktlint work on all source sets. SwiftLint and `swift format` cover the Swift side.
+- **Check the Swift API.** Shared Kotlin is consumed from Swift through a generated framework. Review what your public Kotlin API looks like in Swift, especially `suspend` functions, flows and sealed classes ([concurrency](/foundations/concurrency/)).
+
+## Connecting the iOS app
+
+The shared module compiles to an Apple framework. The Xcode project gets it in one of these ways ([iOS integration methods](https://kotlinlang.org/docs/multiplatform/multiplatform-ios-integration-overview.html)):
+
+| Method | Fits |
+| --- | --- |
+| Direct integration: an Xcode build phase calls Gradle | One repository with both apps. The wizard sets this up. |
+| Swift package with a prebuilt XCFramework | The iOS team consumes the shared code as a versioned binary. |
+| CocoaPods | Existing projects built on CocoaPods. |
+
+Xcode consumes one Kotlin framework, so several shared modules are exported through one umbrella module ([dependency injection and modularization](/core-patterns/dependency-injection/)).
+
+## Build, sign and release
+
+The Android app is released as any Android app, and the iOS app as any iOS app. KMP adds nothing to signing, store upload or rollout. CI needs a macOS runner for the iOS build and tests, and Linux runners can build and test the Android and JVM targets.
+
+<Aside type="caution" title="Watch it!">
+Kotlin/Native compilation is slower than JVM compilation, and a clean iOS build of a large shared module takes minutes. Keep Gradle's build cache and the Kotlin/Native caches enabled, build only the simulator architecture you run during development, and avoid `clean` ([tips for improving compilation time](https://kotlinlang.org/docs/native-improving-compilation-time.html)).
+</Aside>
+
+## Practices to adopt from the start
+
+- Start by sharing the data layer: networking, storage, models and repositories. It has the fewest platform differences and the clearest payoff. Share ViewModels and UI once that works.
+- Keep the public API of the shared module small and deliberate, and mark everything else `internal`. Every public declaration becomes part of the Swift-facing framework.
+- Keep the Kotlin, Compose Multiplatform, AGP and Gradle versions on a combination JetBrains lists as compatible ([compatibility guide](https://kotlinlang.org/docs/multiplatform/multiplatform-compatibility-guide.html)).
+- Give iOS engineers a good path: a Swift-friendly API, documentation comments that carry over, and a way to debug the shared code.
+- Write platform code where the platform differs. Background scheduling, push and permissions are thin native entry points that call shared logic ([background work](/core-patterns/background-work/)).
+
+## Sources
+
+- Setup: [Kotlin Multiplatform quickstart](https://kotlinlang.org/docs/multiplatform/quickstart.html), [Project wizard](https://kmp.jetbrains.com/), [Android Gradle library plugin for KMP](https://developer.android.com/kotlin/multiplatform/plugin), [Update your Kotlin projects for AGP 9.0](https://blog.jetbrains.com/kotlin/2026/01/update-your-projects-for-agp9/), [Compatibility guide](https://kotlinlang.org/docs/multiplatform/multiplatform-compatibility-guide.html)
+- Libraries: [Compose Multiplatform](https://kotlinlang.org/docs/multiplatform/compose-multiplatform.html), [Kotlin Multiplatform on Android](https://developer.android.com/kotlin/multiplatform), [klibs.io](https://klibs.io/), [KMP samples](https://kotlinlang.org/docs/multiplatform/multiplatform-samples.html), [Expected and actual declarations](https://kotlinlang.org/docs/multiplatform/multiplatform-expect-actual.html)
+- Workflow: [Compose Multiplatform 1.10.0](https://blog.jetbrains.com/kotlin/2026/01/compose-multiplatform-1-10-0/), [Test your multiplatform app](https://kotlinlang.org/docs/multiplatform/multiplatform-run-tests.html), [iOS integration methods](https://kotlinlang.org/docs/multiplatform/multiplatform-ios-integration-overview.html), [Tips for improving compilation time](https://kotlinlang.org/docs/native-improving-compilation-time.html)

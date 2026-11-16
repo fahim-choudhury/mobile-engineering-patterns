@@ -1,0 +1,131 @@
+---
+title: Flutter toolkit
+description: What to install, how a Flutter project is laid out, the packages a Dart and Flutter codebase is expected to use, and the daily workflow from hot reload to store builds.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Flutter development is Dart and the Flutter SDK, driven by one command-line tool. The SDK includes the framework, the compiler, a test runner, a formatter and an analyzer, so the tooling is the most uniform of the stacks in this book. Libraries for state, routing and storage are packages from pub.dev, where the team has to choose.
+
+## Install
+
+| Tool | What it is for |
+| --- | --- |
+| [Flutter SDK](https://docs.flutter.dev/get-started) | The framework and the `flutter` and `dart` commands. The Dart SDK is included. |
+| VS Code with the Flutter extension, or Android Studio with the Flutter plugin | Editing, debugging, hot reload and DevTools. |
+| Android Studio | For the Android SDK and emulator. |
+| Xcode, on a Mac | For the iOS simulator and iOS builds. |
+
+Run `flutter doctor` after installing. It lists each missing piece of the Android and iOS toolchains and how to fix it.
+
+Flutter releases on channels, and apps ship from `stable`. The baseline of this book is Flutter 3.50 with Dart 3.14 ([what's new in Flutter 3.50](https://flutter.dev/blog/whats-new-in-flutter-3-50)). Teams that work on several apps pin the SDK version per project with [FVM](https://fvm.app/), a third-party version manager.
+
+## Create and run a project
+
+```sh
+flutter create my_app
+cd my_app
+flutter run                # pick a connected device or emulator
+flutter test               # unit and widget tests
+flutter analyze            # static analysis
+dart format .              # format every Dart file
+flutter pub add dio        # add a dependency
+```
+
+While `flutter run` is active, press `r` for hot reload and `R` for hot restart.
+
+## Project layout
+
+```
+my_app/
+  pubspec.yaml             name, SDK constraint, dependencies, assets
+  pubspec.lock             exact resolved versions
+  analysis_options.yaml    lint rules
+  lib/
+    main.dart              entry point: runApp(...)
+    src/                   your code, by feature or by layer
+    l10n/                  ARB files and generated localizations
+  test/                    unit and widget tests
+  integration_test/        tests that run on a device
+  android/                 Gradle project that hosts the Flutter engine
+  ios/                     Xcode project that hosts the Flutter engine
+```
+
+The `android` and `ios` directories are real native projects, committed to the repository. You open them for signing, permissions, app icons and native plugins' setup steps.
+
+## Default stack
+
+"Official" means it ships with the SDK or is published by the Flutter or Dart team. "Common" means a community package found in many production codebases.
+
+| Concern | Default | Status | Also seen |
+| --- | --- | --- | --- |
+| UI | Flutter widgets with Material or Cupertino | Official | |
+| Architecture | MVVM with repositories and services ([architecture guide](https://docs.flutter.dev/app-architecture/guide)) | Official | Clean Architecture layering |
+| State | `ChangeNotifier` with `ListenableBuilder` | Official | Riverpod, flutter_bloc, provider |
+| Async | `Future`, `Stream`, isolates | Official | |
+| Navigation | go_router | Official | auto_route |
+| Networking | `http` | Official | dio |
+| JSON | json_serializable | Official | freezed for immutable models and unions |
+| Database | drift, sqflite | Common | |
+| Settings and secrets | shared_preferences, flutter_secure_storage | Official, Common | |
+| Dependency injection | provider | Official | Riverpod, get_it |
+| Background work | workmanager | Common | |
+| Push | firebase_messaging | Common | |
+| Strings | `flutter_localizations` with gen-l10n | Official | easy_localization, slang |
+| Images from the network | `Image.network` | Official | cached_network_image |
+| Crashes | Firebase Crashlytics, Sentry | Common | |
+
+Packages that use code generation (json_serializable, freezed, drift, Riverpod's generator) run through `build_runner`:
+
+```sh
+dart run build_runner build      # once
+dart run build_runner watch      # regenerate on save
+```
+
+On pub.dev, check a package's publisher, its supported platforms and its last release before adding it. The [Flutter Favorite](https://docs.flutter.dev/packages-and-plugins/favorites) badge marks packages the Flutter team has vetted.
+
+The reference app is the Compass app from the architecture guide's case study ([architecture case study](https://docs.flutter.dev/app-architecture/case-study)).
+
+## Daily workflow
+
+- **See changes.** Hot reload injects changed code into the running Dart VM and rebuilds the widget tree in under a second, keeping state ([hot reload](https://docs.flutter.dev/tools/hot-reload)). Changes to `main()`, global initializers or native code need a hot restart or a rebuild.
+- **Debug and profile.** Flutter DevTools has a widget inspector, a performance view with frame timings, a memory view and a network view ([DevTools](https://docs.flutter.dev/tools/devtools)). Profile in profile mode on a real device, because debug mode is much slower ([build modes](https://docs.flutter.dev/testing/build-modes)).
+- **Unit and widget test.** `flutter test` runs both without a device. A widget test builds a widget in a test environment and interacts with it ([testing overview](https://docs.flutter.dev/testing/overview)).
+- **Integration test.** The `integration_test` package runs the whole app on a device or emulator.
+- **Golden test.** `matchesGoldenFile` compares a rendered widget with a stored image. Because Flutter draws its own pixels, goldens are stable across devices when fonts are fixed.
+- **Lint and format.** New projects include `flutter_lints` in `analysis_options.yaml`. `dart format` has one style and almost no options. `dart fix --apply` applies automated fixes, including migrations for deprecated APIs.
+
+## Dependencies
+
+`pubspec.yaml` declares version ranges, and `pubspec.lock` records the versions that were resolved. Commit the lock file for apps. `flutter pub outdated` shows what can be upgraded.
+
+Plugins contain native code for each platform. On iOS, Flutter builds them through CocoaPods or Swift Package Manager, and the Flutter documentation tracks the move to Swift Package Manager ([Swift Package Manager for app developers](https://docs.flutter.dev/packages-and-plugins/swift-package-manager/for-app-developers)).
+
+## Build, sign and release
+
+1. **Flavors.** Flavors map to Android product flavors and Xcode schemes, giving `dev`, `staging` and `prod` variants with their own IDs and config ([flavors](https://docs.flutter.dev/deployment/flavors)).
+2. **Build.** `flutter build appbundle` produces the Android App Bundle and `flutter build ipa` the iOS archive. Release builds are compiled ahead of time to native code ([runtime anatomy](/foundations/runtime-anatomy/)).
+3. **Sign.** Signing is the native platforms' own: an upload keystore configured in `android/`, and certificates and profiles in Xcode ([Android deployment](https://docs.flutter.dev/deployment/android), [iOS deployment](https://docs.flutter.dev/deployment/ios)).
+4. **Ship.** Upload to Play Console and App Store Connect, then follow the same tracks, TestFlight, review and staged rollout as a native app.
+5. **Automate.** Any CI can run the `flutter` commands. Flutter's documentation covers fastlane and lists hosted options ([continuous delivery](https://docs.flutter.dev/deployment/cd)).
+
+<Aside type="caution" title="Watch it!">
+Add `--obfuscate --split-debug-info=<dir>` to release builds only together with a plan for the symbol files. Without the saved symbols, stack traces from production are unreadable ([obfuscate Dart code](https://docs.flutter.dev/deployment/obfuscate)).
+</Aside>
+
+## Practices to adopt from the start
+
+- Mark widgets and constructors `const` where possible. The linter suggests it, and it lets Flutter skip rebuilding them ([performance best practices](https://docs.flutter.dev/perf/best-practices)).
+- Keep `build` methods free of work. They run often, and anything slow in them drops frames ([declarative UI](/foundations/declarative-ui/)).
+- Decide on one state management approach for the app and write it down. Mixing three is the usual cause of a hard-to-follow Flutter codebase.
+- Test on both platforms each sprint. A plugin can behave differently on iOS and Android, and permission setup is separate for each.
+- Upgrade Flutter soon after each stable release and run `dart fix --apply`. Deprecations are removed after a published period ([breaking changes](https://docs.flutter.dev/release/breaking-changes)).
+
+## Sources
+
+- Setup: [Get started](https://docs.flutter.dev/get-started), [What's new in Flutter 3.50](https://flutter.dev/blog/whats-new-in-flutter-3-50), [Build modes](https://docs.flutter.dev/testing/build-modes), [FVM](https://fvm.app/)
+- Architecture and packages: [Architecture guide](https://docs.flutter.dev/app-architecture/guide), [Architecture case study](https://docs.flutter.dev/app-architecture/case-study), [Flutter Favorites](https://docs.flutter.dev/packages-and-plugins/favorites), [Swift Package Manager for app developers](https://docs.flutter.dev/packages-and-plugins/swift-package-manager/for-app-developers)
+- Workflow: [Hot reload](https://docs.flutter.dev/tools/hot-reload), [DevTools](https://docs.flutter.dev/tools/devtools), [Testing overview](https://docs.flutter.dev/testing/overview), [Performance best practices](https://docs.flutter.dev/perf/best-practices), [Breaking changes](https://docs.flutter.dev/release/breaking-changes)
+- Release: [Flavors](https://docs.flutter.dev/deployment/flavors), [Android deployment](https://docs.flutter.dev/deployment/android), [iOS deployment](https://docs.flutter.dev/deployment/ios), [Continuous delivery](https://docs.flutter.dev/deployment/cd), [Obfuscate Dart code](https://docs.flutter.dev/deployment/obfuscate)

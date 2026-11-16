@@ -1,0 +1,133 @@
+---
+title: Android toolkit
+description: What to install, how a new Android project is laid out, the libraries a Kotlin and Compose codebase is expected to use, and the daily workflow from Gradle to Play.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Android development is Kotlin, Jetpack Compose and Gradle inside Android Studio. Google publishes an opinionated architecture guide and a set of Jetpack libraries, so most choices on this page have an official default.
+
+## Install
+
+| Tool | What it is for |
+| --- | --- |
+| [Android Studio](https://developer.android.com/studio) | The IDE. It bundles a JDK, the SDK Manager, the emulator and the profilers. The stable release is Rabbit 2 (October 2026). |
+| Android SDK and platform tools | Installed through the SDK Manager on first launch. `adb` talks to devices and emulators. |
+| An emulator image or a phone | Create a virtual device in Device Manager, or enable USB debugging on a phone ([run on a hardware device](https://developer.android.com/studio/run/device)). |
+| Git | Version control. Nothing Android-specific. |
+
+You do not install Gradle or Kotlin. The project's Gradle wrapper downloads the right Gradle, and the build declares its Kotlin version.
+
+## Create and run a project
+
+In Android Studio, choose **New Project** and the **Empty Activity** template, which is a Compose app. Press Run.
+
+From a terminal, the Gradle wrapper does everything the IDE does:
+
+```sh
+./gradlew assembleDebug            # build a debug APK
+./gradlew installDebug             # install it on the connected device
+./gradlew testDebugUnitTest        # unit tests on the JVM
+./gradlew connectedDebugAndroidTest  # instrumented tests on a device
+./gradlew lint                     # Android Lint
+```
+
+## Project layout
+
+```
+my-app/
+  settings.gradle.kts        which modules exist, where plugins come from
+  build.gradle.kts           plugins shared by all modules
+  gradle/
+    libs.versions.toml       version catalog: every dependency and version
+    wrapper/                 pins the Gradle version
+  app/
+    build.gradle.kts         SDK levels, build types, dependencies
+    src/main/
+      AndroidManifest.xml    components, permissions, intent filters
+      kotlin/                source code
+      res/                   strings, drawables, themes
+    src/test/                unit tests (JVM)
+    src/androidTest/         instrumented tests (device)
+```
+
+Three settings in `app/build.gradle.kts` matter from day one. `minSdk` is the oldest Android version you support. `targetSdk` is the version whose behaviour rules you have opted into, and Google Play requires it to be recent ([target API level requirements](https://developer.android.com/google/play/requirements/target-sdk)). `compileSdk` is the SDK you build against.
+
+Since Android Gradle plugin 9.0, Kotlin support is built in, so new projects no longer apply the separate `kotlin-android` plugin ([AGP 9.0 release notes](https://developer.android.com/build/releases/agp-9-0-0-release-notes)). Tutorials written before 2026 show the older setup.
+
+## Default stack
+
+"Official" means Google's documentation uses it. "Common" means most production codebases contain it.
+
+| Concern | Default | Status | Also seen |
+| --- | --- | --- | --- |
+| UI | Jetpack Compose with Material 3 ([Compose](https://developer.android.com/compose)) | Official | Views and XML in older screens |
+| Architecture | UI layer, data layer, optional domain layer ([guide to app architecture](https://developer.android.com/topic/architecture)) | Official | |
+| State | `ViewModel` + `StateFlow` | Official | Molecule, Circuit, Orbit |
+| Async | Kotlin coroutines and `Flow` | Official | RxJava in older code |
+| Navigation | Navigation 3 | Official | Navigation 2, Voyager |
+| Networking | Retrofit + OkHttp | Common | Ktor Client |
+| JSON | kotlinx.serialization | Common | Moshi |
+| Database | Room | Official | SQLDelight |
+| Settings | DataStore | Official | `SharedPreferences` in older code |
+| Dependency injection | Hilt | Official | Koin, Metro |
+| Background work | WorkManager | Official | |
+| Images | [Coil](https://coil-kt.github.io/coil/) | Common | Glide |
+| Annotation processing | [KSP](https://kotlinlang.org/docs/ksp-overview.html) | Official | kapt in older builds |
+| Push and crashes | Firebase Cloud Messaging, Crashlytics | Common | Sentry |
+
+Compose libraries are versioned together through a bill of materials, so you declare one BOM version and no version on each Compose artifact ([Compose BOM](https://developer.android.com/develop/ui/compose/bom)).
+
+The reference app is [Now in Android](https://github.com/android/nowinandroid). It shows the architecture guide, modularization, Hilt, Room, DataStore and the test setup in one codebase.
+
+## Daily workflow
+
+- **See UI changes.** `@Preview` functions render composables in the IDE without running the app. Live Edit pushes composable changes to a running app ([Live Edit](https://developer.android.com/develop/ui/compose/tooling/iterative-development)).
+- **Debug.** Breakpoints, Logcat for logs, Layout Inspector for the Compose tree, and the App Inspection tab for databases, network calls and WorkManager jobs.
+- **Profile.** The CPU, memory and energy profilers are in Android Studio. [LeakCanary](https://square.github.io/leakcanary/) reports memory leaks in debug builds.
+- **Unit test.** JUnit on the JVM, with `kotlinx-coroutines-test` for coroutines and [Turbine](https://github.com/cashapp/turbine) for asserting on flows ([testing coroutines](https://developer.android.com/kotlin/coroutines/test)).
+- **UI test.** Compose UI tests find nodes through the semantics tree ([testing Compose](https://developer.android.com/develop/ui/compose/testing)). Robolectric runs many of them on the JVM without a device.
+- **Screenshot test.** Compose Preview Screenshot Testing turns previews into image comparisons ([docs](https://developer.android.com/studio/preview/compose-screenshot-testing)). Roborazzi and Paparazzi are the community tools.
+- **Lint and format.** Android Lint ships with the build. Teams add [detekt](https://detekt.dev/) for Kotlin static analysis and ktlint or ktfmt for formatting, often through the Spotless Gradle plugin.
+
+## Dependencies
+
+Dependencies are declared once in `gradle/libs.versions.toml` and referenced from module build files as `libs.something` ([version catalogs](https://developer.android.com/build/migrate-to-catalogs)). A bot such as Renovate or Dependabot opens upgrade pull requests against that one file.
+
+```toml
+[versions]
+room = "3.0.3"
+
+[libraries]
+room-runtime = { module = "androidx.room3:room3-runtime", version.ref = "room" }
+```
+
+## Build, sign and release
+
+1. **Build types and flavors.** `debug` and `release` exist by default. Product flavors add variants such as `staging` and `production`, each with its own application ID suffix and server URL ([configure build variants](https://developer.android.com/build/build-variants)).
+2. **Shrink.** Release builds run R8, which removes unused code and obfuscates names ([shrink your app](https://developer.android.com/build/shrink-code)). Test the release build, because R8 can remove code that is only reached by reflection.
+3. **Sign.** You sign uploads with an upload key, and Play App Signing holds the key that users' devices verify ([sign your app](https://developer.android.com/studio/publish/app-signing)).
+4. **Package.** Google Play requires an Android App Bundle (`./gradlew bundleRelease`), from which it generates APKs per device ([app bundles](https://developer.android.com/guide/app-bundle)).
+5. **Ship.** Upload to the internal testing track, promote to closed or open testing, then to production with a staged rollout ([Play Console testing tracks](https://support.google.com/googleplay/android-developer/answer/9845334)).
+6. **Automate.** CI runs the Gradle tasks above. [Gradle Play Publisher](https://github.com/Triple-T/gradle-play-publisher) or fastlane uploads the bundle.
+
+## Practices to adopt from the start
+
+- Turn on the Gradle build cache and configuration cache, and keep `gradle.properties` in the repository ([optimize your build speed](https://developer.android.com/build/optimize-your-build)).
+- Add a Baseline Profile once the app has a real startup path. It precompiles the code users hit first ([Baseline Profiles](https://developer.android.com/topic/performance/baselineprofiles/overview)).
+- Enable `StrictMode` in debug builds to catch disk and network access on the main thread ([concurrency](/foundations/concurrency/)).
+- Test with "Don't keep activities" enabled in developer options. It reproduces state loss that otherwise shows up only in production ([app lifecycle](/foundations/app-lifecycle/)).
+- Watch Android vitals in Play Console for crash and ANR rates. Bad vitals reduce your app's visibility in the store ([Android vitals](https://developer.android.com/topic/performance/vitals)).
+
+<Aside type="caution" title="Watch it!">
+The emulator's default images are fast, recent Pixels. Add a low-memory device profile and an older API level to your device list, and run the app on a mid-range phone from a manufacturer your users own before each release.
+</Aside>
+
+## Sources
+
+- Setup and build: [Android Studio](https://developer.android.com/studio), [Android Studio release notes](https://developer.android.com/studio/releases), [AGP 9.0 release notes](https://developer.android.com/build/releases/agp-9-0-0-release-notes), [Version catalogs](https://developer.android.com/build/migrate-to-catalogs), [Build variants](https://developer.android.com/build/build-variants), [Optimize your build speed](https://developer.android.com/build/optimize-your-build)
+- Architecture and libraries: [Guide to app architecture](https://developer.android.com/topic/architecture), [Compose](https://developer.android.com/compose), [Compose BOM](https://developer.android.com/develop/ui/compose/bom), [KSP](https://kotlinlang.org/docs/ksp-overview.html), [Now in Android](https://github.com/android/nowinandroid)
+- Testing: [Testing Compose](https://developer.android.com/develop/ui/compose/testing), [Testing coroutines](https://developer.android.com/kotlin/coroutines/test), [Compose Preview Screenshot Testing](https://developer.android.com/studio/preview/compose-screenshot-testing)
+- Release: [Sign your app](https://developer.android.com/studio/publish/app-signing), [Shrink your app](https://developer.android.com/build/shrink-code), [Android App Bundles](https://developer.android.com/guide/app-bundle), [Target API level requirements](https://developer.android.com/google/play/requirements/target-sdk), [Baseline Profiles](https://developer.android.com/topic/performance/baselineprofiles/overview), [Android vitals](https://developer.android.com/topic/performance/vitals)
