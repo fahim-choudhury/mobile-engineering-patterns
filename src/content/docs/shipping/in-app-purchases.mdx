@@ -1,0 +1,351 @@
+---
+title: In-app purchases
+description: How a purchase travels from the store's payment sheet to an entitlement on your backend, how subscriptions change while the app is closed, and the purchase flow with StoreKit, Play Billing and their cross-platform wrappers.
+sidebar:
+  order: 8
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A meditation app adds a yearly subscription. The support inbox fills up:
+
+- "I paid and the app still shows the paywall." The app was killed while the payment sheet was open, and the code that unlocks premium ran only in the purchase callback.
+- "I was charged, then refunded three days later, and I never asked for a refund." The Android app never acknowledged the purchase.
+- A user's subscription renewed on the App Store. The backend's record expired the same day, because nothing told the backend about the renewal.
+- A user got a refund from Apple in January and still has premium in June.
+- "I subscribed on my iPhone. Why is my Android tablet asking me to pay?"
+
+The payment sheet worked every time. The bugs are in what the app and backend did before and after it.
+
+<BrainPower>
+A user buys premium on a phone without creating an account in your app. A year later they install the app on a new phone. How does the app find out that they paid?
+</BrainPower>
+
+## Constraints on a phone
+
+- **Digital goods go through the store's billing.** Apple's guidelines require in-app purchase for unlocking features and content in the app ([App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/), 3.1.1), and Google Play's payments policy requires Play's billing system for the same ([Play payments policy](https://support.google.com/googleplay/android-developer/answer/9858738)). Physical goods and services consumed outside the app, such as a taxi ride or a pizza, use ordinary payment processors. Exceptions and alternatives exist per region and changed several times in 2025 and 2026, so read the current policy for each country you sell in.
+- **The purchase belongs to a store account.** The App Store or Play knows that an Apple or Google account bought a product. It does not know your user ID unless you attach one.
+- **The transaction can finish without your app.** A parent approves a child's request the next day. A cash payment at a shop completes hours later. A subscription renews, fails to renew, is refunded or is cancelled from the store's settings while the app is not running.
+- **The client is not trusted.** A modified app can claim a purchase happened ([security and privacy](/shipping/security-privacy/)). Proof of purchase is a signed record from the store, checked on a server.
+- **The store takes a commission and sets rules for prices.** The rate depends on the program, the product type and the region ([App Store Small Business Program](https://developer.apple.com/app-store/small-business-program/), [Google Play service fees](https://support.google.com/googleplay/android-developer/answer/16954621)). Prices are chosen per storefront, and the store collects and remits sales tax in most countries.
+
+## Product types
+
+| Kind | App Store | Google Play | Example |
+| --- | --- | --- | --- |
+| Used up and bought again | Consumable | One-time product, consumed after purchase | 100 coins |
+| Bought once, kept | Non-consumable | One-time product, not consumed | Remove ads, a level pack |
+| Recurring until cancelled | Auto-renewable subscription, in a subscription group | Subscription with base plans and offers | Monthly or yearly premium |
+| Fixed period, no renewal | Non-renewing subscription | Prepaid base plan | A season pass |
+
+## The pattern
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  store: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App" { class: app }
+store: "App Store\nor Google Play" { class: store }
+backend: "Your backend" { class: srv }
+app -> store: "1. buy product,\ntagged with your user ID" { style.font-size: 16 }
+store -> app: "2. signed transaction" { style.font-size: 16 }
+app -> backend: "3. send the transaction" { style.font-size: 16 }
+backend -> store: "4. verify with the\nstore's server API" { style.font-size: 16 }
+backend -> app: "5. entitlement:\npremium until 2027-11-16" { style.font-size: 16 }
+app -> store: "6. finish or\nacknowledge" { style.font-size: 16 }
+store -> backend: "7. later: renewed,\nrefunded, expired" { style.font-size: 16 }
+```
+
+1. **Fetch products from the store.** The app asks for products by ID and shows the localized name and price string the store returns. Prices are never written in the app.
+2. **Tag the purchase with your user.** Pass an opaque account identifier into the purchase, so the server-side record can be matched to an account.
+3. **Verify on the backend.** The app sends the signed transaction or purchase token. The backend checks it with the store and writes an entitlement: this user has premium until this date.
+4. **Finish only after granting.** The app tells the store that the purchase was delivered once the backend has confirmed. An unfinished transaction is delivered to the app again on the next launch, which makes the flow safe against crashes and kills.
+5. **Listen from app start.** A listener for transaction updates starts at launch, before any paywall is shown, and handles purchases that completed while the app was closed.
+6. **Let the store notify the backend.** Server notifications report renewals, cancellations, billing problems and refunds. The backend updates the entitlement without the app.
+7. **Read the entitlement from one place.** Screens ask "is premium active?" of a single source that is backed by the backend and cached for offline use ([persistence](/core-patterns/persistence/)).
+
+The Brain Power answer follows from step 2 and the store account. Without an app account, the only link is the store account: the new phone signs in to the same Apple or Google account, and the app asks the store for that account's current purchases. This is what a "Restore purchases" button does. With an app account, the backend already holds the entitlement and any device that signs in receives it.
+
+## The purchase flow in each stack
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+val billingClient = BillingClient.newBuilder(context)
+    .setListener(::onPurchasesUpdated)
+    .enablePendingPurchases(PendingPurchasesParams.newBuilder().enableOneTimeProducts().build())
+    .enableAutoServiceReconnection()
+    .build()
+
+fun buy(activity: Activity, product: ProductDetails, offerToken: String) {
+    val params = BillingFlowParams.newBuilder()
+        .setProductDetailsParamsList(
+            listOf(
+                BillingFlowParams.ProductDetailsParams.newBuilder()
+                    .setProductDetails(product)
+                    .setOfferToken(offerToken)        // which base plan or offer
+                    .build()
+            )
+        )
+        .setObfuscatedAccountId(hashedUserId)
+        .build()
+    billingClient.launchBillingFlow(activity, params)
+}
+
+private fun onPurchasesUpdated(result: BillingResult, purchases: List<Purchase>?) {
+    if (result.responseCode != BillingClient.BillingResponseCode.OK) return
+    purchases.orEmpty()
+        .filter { it.purchaseState == Purchase.PurchaseState.PURCHASED }   // not PENDING
+        .forEach { purchase ->
+            scope.launch {
+                backend.verifyAndGrant(purchase.purchaseToken)   // server asks Google, then acknowledges
+            }
+        }
+}
+```
+The Play Billing Library (9.x; Play accepts version 8 or later for new uploads) connects to the Play Store app on the device ([integrate the Play Billing Library](https://developer.android.com/google/play/billing/integrate), [release notes](https://developer.android.com/google/play/billing/release-notes)). The result of a purchase arrives in the listener, and also from `queryPurchasesAsync`, which the app calls on every start and resume to pick up purchases made elsewhere. A purchase must be acknowledged within three days or Google refunds it. The acknowledgement can come from the app with `acknowledgePurchase` or from the backend through the Play Developer API, and doing it on the backend after writing the entitlement keeps the order right. A `PENDING` purchase has not been paid yet and grants nothing.
+</TabItem>
+<TabItem label="iOS">
+```swift
+@MainActor
+final class Store {
+    private var updates: Task<Void, Never>?
+
+    // Call once at launch.
+    func start() {
+        updates = Task(priority: .background) {
+            for await result in Transaction.updates {
+                await self.handle(result)
+            }
+        }
+    }
+
+    func buy(_ product: Product) async throws {
+        let result = try await product.purchase(options: [.appAccountToken(userUUID)])
+        switch result {
+        case .success(let verification): await handle(verification)
+        case .pending: break          // for example Ask to Buy: arrives later in Transaction.updates
+        case .userCancelled: break
+        @unknown default: break
+        }
+    }
+
+    private func handle(_ result: VerificationResult<Transaction>) async {
+        guard let transaction = try? result.payloadValue else { return }   // signature check failed
+        do {
+            try await backend.verifyAndGrant(jws: result.jwsRepresentation)
+            await transaction.finish()
+        } catch {
+            // Not finished: StoreKit delivers it again on the next launch.
+        }
+    }
+}
+```
+StoreKit's Swift API delivers each transaction as a JSON Web Signature signed by Apple, already verified on the device, and the same string can be verified again by a server ([In-App Purchase](https://developer.apple.com/documentation/storekit/in-app-purchase), [Transaction.updates](https://developer.apple.com/documentation/storekit/transaction/updates)). `Transaction.currentEntitlements` lists what the signed-in Apple account owns now, which is the basis for restoring purchases. The original StoreKit API with `SKPaymentQueue` was deprecated in iOS 18 ([WWDC24: What's new in StoreKit and In-App Purchase](https://developer.apple.com/videos/play/wwdc2024/10061/)). SwiftUI has ready-made paywall views, `SubscriptionStoreView` and `StoreView`, that load products and run the purchase ([StoreKit](https://developer.apple.com/documentation/storekit)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import Purchases from 'react-native-purchases';
+
+// Once at startup, then again when the user signs in.
+Purchases.configure({
+  apiKey: Platform.select({ ios: RC_IOS_KEY, android: RC_ANDROID_KEY })!,
+});
+await Purchases.logIn(userId);
+
+export async function buyYearly() {
+  const offerings = await Purchases.getOfferings();
+  const yearly = offerings.current?.annual;
+  if (!yearly) return false;
+
+  const { customerInfo } = await Purchases.purchasePackage(yearly);
+  return customerInfo.entitlements.active['premium'] !== undefined;
+}
+
+Purchases.addCustomerInfoUpdateListener((info) => {
+  setPremium(info.entitlements.active['premium'] !== undefined);
+});
+```
+React Native has no purchase API of its own. Expo's guide names two libraries ([in-app purchases in Expo](https://docs.expo.dev/guides/in-app-purchases/)). `react-native-purchases` is the client for RevenueCat, a hosted service that wraps StoreKit and Play Billing and also does the server side: verification, store notifications and one entitlement record across platforms ([RevenueCat documentation](https://www.revenuecat.com/docs/)). The sample uses it, and steps 3 to 7 of the pattern happen on RevenueCat's servers. `expo-iap` exposes the two store APIs directly behind a common interface, for teams that run their own verification backend ([expo-iap](https://www.openiap.dev/docs/setup/expo)). Both contain native code and need a development build. A JavaScript bundle delivered over the air cannot add or change the native billing code.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+final _iap = InAppPurchase.instance;
+late final StreamSubscription<List<PurchaseDetails>> _subscription;
+
+// Call once at startup, before showing a paywall.
+void startPurchaseListener() {
+  _subscription = _iap.purchaseStream.listen((purchases) async {
+    for (final purchase in purchases) {
+      if (purchase.status == PurchaseStatus.purchased ||
+          purchase.status == PurchaseStatus.restored) {
+        await backend.verifyAndGrant(purchase.verificationData.serverVerificationData);
+      }
+      // Pending purchases grant nothing and are not completed yet.
+      if (purchase.pendingCompletePurchase) {
+        await _iap.completePurchase(purchase);
+      }
+    }
+  });
+}
+
+Future<void> buy(ProductDetails product) =>
+    _iap.buyNonConsumable(purchaseParam: PurchaseParam(productDetails: product));
+```
+`in_app_purchase` (3.3) is the Flutter team's plugin over StoreKit and Play Billing ([in_app_purchase](https://pub.dev/packages/in_app_purchase)). Every result arrives on `purchaseStream`, including purchases that completed while the app was closed, so the listener starts at launch. `completePurchase` is the plugin's name for finishing a transaction on iOS and acknowledging it on Android. Subscriptions are bought with `buyNonConsumable` as well. The plugin covers the client only. Verification and store notifications are yours to build, or come from a service such as RevenueCat, which has its own Flutter SDK.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: one model of what the user owns, shared by both apps.
+data class Entitlement(val product: String, val expiresAt: Instant?, val inGracePeriod: Boolean)
+
+interface BillingGateway {
+    suspend fun products(ids: List<String>): List<StoreProduct>
+    suspend fun purchase(productId: String): PurchaseOutcome   // Completed, Pending, Cancelled
+}
+
+class EntitlementRepository(private val api: EntitlementApi, private val cache: EntitlementCache) {
+    val premium: Flow<Boolean> = cache.entitlements.map { list -> list.any { it.product == "premium" } }
+
+    suspend fun refresh() = cache.replace(api.entitlements())   // backend is the source of truth
+}
+```
+There is no official multiplatform billing API. The store SDKs are platform libraries with platform UI, so `BillingGateway` is implemented with Play Billing in `androidMain` and with StoreKit in Swift, passed into the shared module. What shares well is everything after the purchase: the entitlement model, the repository, the paywall's state holder and the calls to your backend. RevenueCat publishes a Kotlin Multiplatform SDK that provides the gateway and the server side together ([purchases-kmp](https://github.com/RevenueCat/purchases-kmp), 3.x).
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Grant first, finish second. If the app finishes or acknowledges a transaction before the entitlement is stored on the backend and a crash happens in between, the user has paid and nothing will redeliver the purchase. If the app never finishes it, iOS keeps redelivering the transaction and Google Play refunds it after three days.
+</Aside>
+
+## Subscriptions change while the app is closed
+
+```d2
+classes: {
+  on: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  risk: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  off: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+active: "Active" { class: on }
+cancelled: "Cancelled:\nactive until\nperiod end" { class: on }
+grace: "Payment failed:\ngrace period,\nstill has access" { class: risk }
+hold: "Billing retry\nor account hold:\nno access" { class: off }
+expired: "Expired" { class: off }
+revoked: "Refunded\nor revoked" { class: off }
+active -> active: "renewed"
+active -> cancelled: "user turns off\nauto-renew"
+cancelled -> expired
+active -> grace
+grace -> active: "payment\nrecovered"
+grace -> hold
+hold -> expired
+active -> revoked
+```
+
+| | App Store | Google Play |
+| --- | --- | --- |
+| Push to your backend | App Store Server Notifications, version 2 ([App Store Server Notifications](https://developer.apple.com/documentation/appstoreservernotifications)) | Real-time developer notifications through Cloud Pub/Sub ([RTDN reference](https://developer.android.com/google/play/billing/rtdn-reference)) |
+| Ask for current state | App Store Server API ([App Store Server API](https://developer.apple.com/documentation/appstoreserverapi)) | `purchases.subscriptionsv2.get` ([Play Developer API](https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptionsv2/get)) |
+| Renewal | `DID_RENEW` | `SUBSCRIPTION_RENEWED` |
+| Payment failed | `DID_FAIL_TO_RENEW` | `SUBSCRIPTION_IN_GRACE_PERIOD`, `SUBSCRIPTION_ON_HOLD` |
+| Refund | `REFUND` | `SUBSCRIPTION_REVOKED` |
+| Your user ID on the record | `appAccountToken` | `obfuscatedExternalAccountId` |
+| Official server libraries | App Store Server Library for Swift, Java, Python and Node ([Node library](https://github.com/apple/app-store-server-library-node)) | Google API client libraries |
+
+Three of the opening bugs are missing rows of this table. The backend that expired a renewed subscription had no notifications. The user who kept premium after a refund was never revoked. The Android tablet could not know about an iPhone purchase, because the entitlement lived on the phone and not on the backend against an account. Google documents the full subscription lifecycle and which state grants access ([subscription lifecycle](https://developer.android.com/google/play/billing/lifecycle/subscriptions)).
+
+A notification can be lost or arrive out of order. Treat each one as a hint to fetch the current state from the store's API, and run a daily reconciliation for subscriptions close to their renewal date.
+
+## Testing purchases
+
+| Level | App Store | Google Play |
+| --- | --- | --- |
+| Local, no store server | StoreKit configuration file in Xcode, with simulated renewals, failures and refunds ([StoreKit testing in Xcode](https://developer.apple.com/documentation/xcode/setting-up-storekit-testing-in-xcode)) | None |
+| Store test environment | Sandbox accounts, with shortened subscription periods ([testing with sandbox](https://developer.apple.com/documentation/storekit/testing-in-app-purchases-with-sandbox)) | License testers with test payment methods and shortened periods ([test your integration](https://developer.android.com/google/play/billing/test)) |
+| Beta | TestFlight purchases use the sandbox | Internal and closed test tracks |
+
+Test the paths that the happy path skips: the app killed while the sheet is open, a pending purchase approved later, a declined renewal, a refund, and a restore on a second device.
+
+## Trade-offs and scale
+
+**Building against buying.** The client code is a few hundred lines per platform. The server is the larger part: two verification APIs, two notification formats, a state machine with grace periods and refunds, reconciliation, and analytics. Services such as RevenueCat, Adapty and Qonversion sell that server, for a share of revenue and a dependency on their uptime. Small teams usually buy. Teams with a payments backend already often build.
+
+**Entitlements across platforms.** With an account system, a subscription bought on any platform is an entitlement on the backend, and every client reads it. Store rules restrict how an app may mention or link to purchase options outside the store, and these rules differ by country and were changed by court rulings and regulation in 2025 and 2026. Check the current guideline text before adding a "subscribe on the web" link.
+
+**Paywalls are experiments.** Price, trial length and layout are tested like any feature ([feature flags and experimentation](/shipping/feature-flags/)). The products themselves live in the store consoles, so plan the variants ahead and create their products before the test.
+
+**Old versions keep selling.** A paywall in version 3.0 offers the product IDs it was built with for as long as that version is in use ([old app versions](/shipping/old-versions/)). Do not delete or repurpose a product ID. Stop selling a product by removing it from sale in the console, and make sure old paywalls handle a product that is no longer returned.
+
+**Library deadlines.** Google Play accepts each major Billing Library version for about two years. Since August 31, 2026, new uploads need version 8 or later ([Billing Library deprecation](https://developer.android.com/google/play/billing/deprecation-faq)). Cross-platform plugins bundle a specific version, so the plugin has to be upgraded on the same schedule.
+
+**Involuntary churn.** A failed card ends many subscriptions that the user did not mean to cancel. Enable the stores' grace periods, keep access during them, and tell the user in the app that the payment needs attention.
+
+**Offline.** The cached entitlement lets a paying user in without a network. Give the cache an expiry a little past the paid period, so that a refunded or expired subscription stops working after the device reconnects.
+
+<NoDumbQuestions>
+<dt>Do I need a backend at all?</dt>
+<dd>An app on one platform, without accounts, selling a one-time unlock can rely on the device: StoreKit verifies transactions locally and lists current entitlements, and Play Billing returns the account's purchases. You need a server, yours or a service's, for cross-platform access, account-based entitlements, protection against tampering, and to react to refunds.</dd>
+
+<dt>Can I use Stripe or another processor in the app?</dt>
+<dd>For physical goods and real-world services, yes, and the store billing systems may not be used for those. For digital content used in the app, the default answer on both stores is no, with exceptions that depend on the app category and the country. Read the current policies cited above.</dd>
+
+<dt>What does "Restore purchases" do?</dt>
+<dd>It asks the store for the purchases of the signed-in store account and runs them through the same verify-and-grant path. Apple's guidelines require a restore mechanism for restorable purchases. On StoreKit's current API the entitlements are available without a button, and the button calls <code>AppStore.sync()</code> for the rare case that they are out of date.</dd>
+
+<dt>Why must the price come from the store?</dt>
+<dd>The price differs per country, includes or excludes tax depending on local law, and can be changed in the console without a release. The store returns a formatted string for the user's storefront.</dd>
+
+<dt>What happens when a user cancels?</dt>
+<dd>Cancelling turns off renewal. The subscription stays active until the end of the paid period, and the store sends a notification that the renewal status changed. Keep access until expiry, and consider showing an offer to stay.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Store library | Play Billing Library | StoreKit | `react-native-purchases`, `expo-iap` | `in_app_purchase` | Native per platform, or `purchases-kmp` |
+| Load products | `queryProductDetailsAsync` | `Product.products(for:)` | `getOfferings()` | `queryProductDetails` | Gateway interface |
+| Start a purchase | `launchBillingFlow` | `product.purchase()` | `purchasePackage()` | `buyNonConsumable`, `buyConsumable` | Gateway interface |
+| Results arrive in | `PurchasesUpdatedListener` | `Transaction.updates` | Customer info listener | `purchaseStream` | Flow from the gateway |
+| Proof sent to the server | Purchase token | JWS transaction | Handled by the service | `serverVerificationData` | Per platform |
+| Mark as delivered | `acknowledgePurchase`, `consumeAsync` | `transaction.finish()` | Handled by the SDK | `completePurchase` | Per platform |
+| Current purchases | `queryPurchasesAsync` | `Transaction.currentEntitlements` | `getCustomerInfo()` | `restorePurchases()` | Backend entitlement API |
+| Not yet paid | `PurchaseState.PENDING` | `.pending` | Pending result | `PurchaseStatus.pending` | `PurchaseOutcome.Pending` |
+| Link to your user | `setObfuscatedAccountId` | `appAccountToken` | `logIn(userId)` | `applicationUserName` | Per platform |
+| Subscription variants | Base plans and offers | Subscription group, offers | Offerings and packages | Product IDs per variant | Per platform |
+
+<Exercise>
+For each of the five reports at the top of this chapter, name the step of the pattern that was missing and the change that fixes it.
+
+<Fragment slot="answer">
+1. **Paid, still sees the paywall.** Step 5 was missing: no listener at app start. The transaction was waiting in the store's queue. Start `Transaction.updates`, `purchaseStream` or a `queryPurchasesAsync` call at launch and run every result through verify-and-grant.
+2. **Refunded after three days.** Step 4: the Android purchase was never acknowledged. Acknowledge after the backend has written the entitlement, from the app or through the Play Developer API.
+3. **Renewed in the store, expired on the backend.** Step 6: no server notifications. Configure App Store Server Notifications and real-time developer notifications, and add a daily reconciliation that asks the store for subscriptions near their expiry date.
+4. **Refunded and still premium.** Step 6 again, for the refund notification, plus step 7: the app read a local flag set at purchase time. Handle `REFUND` and `SUBSCRIPTION_REVOKED` on the backend, and make the app read the entitlement from the backend with a cache that expires.
+5. **Subscribed on iPhone, asked to pay on Android.** Steps 2 and 3: the purchase was never attached to an app account. Pass the account identifier into the purchase, store the entitlement on the backend against the user, and have every platform read it after sign-in.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** has no built-in purchase API. Apps use platform bindings, a community plugin or a service SDK.
+- **Ionic / Capacitor** apps use a purchase plugin or a service SDK such as RevenueCat's Capacitor plugin. The web layer must not process payments for digital goods on its own.
+- **Lynx** leaves purchases to the host app's native code.
+
+## Sources
+
+- Policy and fees: [App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/) (3.1), [Google Play payments policy](https://support.google.com/googleplay/android-developer/answer/9858738), [App Store Small Business Program](https://developer.apple.com/app-store/small-business-program/), [Auto-renewable subscriptions](https://developer.apple.com/app-store/subscriptions/), [Google Play service fees](https://support.google.com/googleplay/android-developer/answer/16954621)
+- Android: [Integrate the Play Billing Library](https://developer.android.com/google/play/billing/integrate), [Play Billing Library release notes](https://developer.android.com/google/play/billing/release-notes) (9.x), [Billing Library deprecation](https://developer.android.com/google/play/billing/deprecation-faq), [Subscription lifecycle](https://developer.android.com/google/play/billing/lifecycle/subscriptions), [About subscriptions](https://developer.android.com/google/play/billing/subscriptions), [Real-time developer notifications reference](https://developer.android.com/google/play/billing/rtdn-reference), [purchases.subscriptionsv2.get](https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptionsv2/get), [Fight fraud and abuse](https://developer.android.com/google/play/billing/security), [Test your integration](https://developer.android.com/google/play/billing/test)
+- iOS: [StoreKit](https://developer.apple.com/documentation/storekit), [In-App Purchase](https://developer.apple.com/documentation/storekit/in-app-purchase), [Transaction.updates](https://developer.apple.com/documentation/storekit/transaction/updates), [Transaction.currentEntitlements](https://developer.apple.com/documentation/storekit/transaction/currententitlements), [appAccountToken](https://developer.apple.com/documentation/storekit/product/purchaseoption/appaccounttoken(_:)), [App Store Server Notifications](https://developer.apple.com/documentation/appstoreservernotifications), [App Store Server API](https://developer.apple.com/documentation/appstoreserverapi), [App Store Server Library for Node](https://github.com/apple/app-store-server-library-node), [Setting up StoreKit Testing in Xcode](https://developer.apple.com/documentation/xcode/setting-up-storekit-testing-in-xcode), [Testing In-App Purchases with sandbox](https://developer.apple.com/documentation/storekit/testing-in-app-purchases-with-sandbox), [WWDC24: What's new in StoreKit and In-App Purchase](https://developer.apple.com/videos/play/wwdc2024/10061/), [WWDC26: What's new in Apple In-App Purchase](https://developer.apple.com/videos/play/wwdc2026/210/)
+- React Native: [In-app purchases in Expo](https://docs.expo.dev/guides/in-app-purchases/), [RevenueCat documentation](https://www.revenuecat.com/docs/), [expo-iap setup](https://www.openiap.dev/docs/setup/expo)
+- Flutter: [in_app_purchase](https://pub.dev/packages/in_app_purchase) (3.3)
+- KMP: [purchases-kmp](https://github.com/RevenueCat/purchases-kmp) (3.x)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 12 (in-app purchases)

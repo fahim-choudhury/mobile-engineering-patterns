@@ -1,0 +1,248 @@
+---
+title: Releases you can't roll back
+description: How a mobile release reaches users through build trains, beta tracks and staged rollouts, what each store lets you stop or undo, and where over-the-air updates for React Native and Flutter fit.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A shopping app ships version 4.2.0 on a Thursday afternoon. The reports that follow:
+
+- The app crashes on launch for every user who had items in the cart before updating. The fix is one line and is merged within the hour. Ten days later, a fifth of the affected users still have the broken version.
+- The release contains half of a redesigned checkout, because the branch was cut while the feature was in progress.
+- A JavaScript hotfix is pushed over the air on Friday. It calls a native module that only exists in 4.2.0, and the users still on 4.1.0 start crashing as well.
+
+A web team would have reverted the deploy at the first report. A mobile team has no deploy to revert, because the code is installed on other people's phones.
+
+<BrainPower>
+You find a launch crash one hour after releasing to 100% of users. List everything you can do in the next ten minutes that changes what a user experiences. Then list what takes a day or more.
+</BrainPower>
+
+## Constraints on a phone
+
+- **The binary lives on the device.** You can publish a new version. You cannot remove or replace the one a user has installed. Updates arrive when the device decides to install them or when the user taps "Update".
+- **A review sits between you and users.** Apple states that 90% of submissions are reviewed in less than 24 hours on average, and offers an expedited review for a critical bug fix ([App Review](https://developer.apple.com/distribute/app-review/), [request an expedited review](https://developer.apple.com/help/app-review/after-submitting-for-review/request-expedited-review/)). Google Play reviews releases too ([publish your app](https://support.google.com/googleplay/android-developer/answer/9859751)).
+- **Versions only go up.** Neither store installs an older build over a newer one. "Rolling back" means shipping the old code again under a higher version number.
+- **Compiled code cannot be downloaded at runtime.** Apple's license agreement allows an app to download interpreted code as long as it does not change the app's primary purpose or bypass OS security ([Apple Developer Program License Agreement](https://developer.apple.com/support/terms/apple-developer-program-license-agreement/), section 3.3.1(B)). Google Play forbids an app from updating itself outside Play and from downloading executable code such as dex files or native libraries ([device and network abuse policy](https://support.google.com/googleplay/android-developer/answer/16559646)). This is the reason over-the-air updates exist for JavaScript and do not exist for Kotlin or Swift.
+
+## The pattern
+
+1. **Ship on a schedule.** A release branch is cut on a fixed day, for example every second Monday. This is a build train: it leaves on time, and a feature that is not ready waits for the next one.
+2. **Merge unfinished work behind a flag.** Code for a feature in progress is on the main branch and switched off ([feature flags](/shipping/feature-flags/)). The branch cut then never contains half a feature that users can reach.
+3. **Stabilize on a beta track.** The release candidate goes to employees and beta testers for a few days. Only fixes are added to the branch.
+4. **Roll out in stages.** The release goes to a small percentage of users first. Each increase waits for the crash and business metrics of the previous stage ([crashes, hangs and observability](/shipping/observability/)).
+5. **Separate release from launch.** The binary reaches 100% of users with the new feature off. Turning the feature on is a configuration change you can undo in minutes.
+6. **Rehearse the hotfix.** Branching from the release tag, building, signing and submitting a fix is a scripted path that the team has run before the day it is needed.
+
+```d2
+classes: {
+  dev: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  beta: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  prod: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  stop: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+train: "One release train" {
+  style.font-size: 18
+  grid-rows: 2
+  grid-columns: 4
+  grid-gap: 12
+  a: "Main branch:\nflags off for\nunfinished work" { class: dev }
+  b: "Branch cut\non schedule" { class: dev }
+  c: "Beta track:\nemployees,\ntesters" { class: beta }
+  d: "Store review" { class: beta }
+  e: "1% to 5%" { class: prod }
+  f: "20% to 50%" { class: prod }
+  g: "100%" { class: prod }
+  h: "Turn the\nfeature flag on" { class: prod }
+}
+gate: "Before each increase: crash rate, hangs,\norders per session against the last version" { class: stop }
+train -> gate: "bad numbers halt the rollout" { style.font-size: 16 }
+```
+
+## Remedies, ordered by speed
+
+This table answers the Brain Power question. The remedies are ordered by how quickly they reach a user.
+
+| Remedy | Reaches users in | Fixes | Limit |
+| --- | --- | --- | --- |
+| Turn a feature flag off | Minutes, on the next config fetch | Code that was shipped behind a flag | The flag had to exist before the release |
+| Change the backend | Minutes | Bugs triggered by a response the server controls | The client code stays broken |
+| Over-the-air update | The next one or two app launches | JavaScript or Dart code and assets | Not native code. Not for native stacks |
+| Halt the rollout | Immediately, for users who do not have the build yet | Nothing. It stops the spread | Installed copies stay installed |
+| Hotfix release | Hours to days: build, review, then each user's update | Anything | The slowest path, and users update at their own pace |
+| Force an upgrade | After the hotfix is live | Users who would otherwise stay on the bad build | Costs goodwill ([old app versions](/shipping/old-versions/)) |
+
+The cart crash from the opening had only the last three rows available, because the migration code was not behind a flag and ran before any network call.
+
+## A staged rollout in each stack
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```json
+{
+  "track": "production",
+  "releases": [
+    {
+      "name": "4.2.0",
+      "versionCodes": ["420"],
+      "status": "inProgress",
+      "userFraction": 0.05
+    }
+  ]
+}
+```
+This is the body of a `tracks.update` call in the Google Play Developer API, the same operation as the percentage field in Play Console ([APKs and tracks](https://developers.google.com/android-publisher/tracks)). Play has an internal test track, closed and open test tracks, and production. You choose every percentage yourself, and the users in a staged rollout are picked at random ([staged rollouts](https://support.google.com/googleplay/android-developer/answer/6346149)). Setting `status` to `halted` stops the release from reaching more users. Since 2025 you can also halt a release that is already at 100%, and Play then offers the previous version to new users and to users who have not updated yet ([halting a fully rolled-out release](https://support.google.com/googleplay/android-developer/answer/16285429)). Managed publishing holds an approved release until you press publish, which lets you line up the Android release with iOS ([control when changes are published](https://support.google.com/googleplay/android-developer/answer/9859654)).
+</TabItem>
+<TabItem label="iOS">
+```http
+PATCH https://api.appstoreconnect.apple.com/v1/appStoreVersionPhasedReleases/{id}
+
+{
+  "data": {
+    "type": "appStoreVersionPhasedReleases",
+    "id": "{id}",
+    "attributes": { "phasedReleaseState": "PAUSED" }
+  }
+}
+```
+The App Store has one staged mechanism, called phased release, and its schedule is fixed: 1%, 2%, 5%, 10%, 20%, 50% and 100% of users with automatic updates on, one step per day for seven days. You can pause it for up to 30 days in total or release to everyone at once ([release a version update in phases](https://developer.apple.com/help/app-store-connect/update-your-app/release-a-version-update-in-phases/)). The request above pauses it through the App Store Connect API ([phased releases](https://developer.apple.com/documentation/appstoreconnectapi/app-store-version-phased-releases)). A phased release only controls automatic updates: any user can open the App Store and install the new version by hand. Before the store, TestFlight distributes builds to up to 100 internal and 10,000 external testers, and each build expires after 90 days ([TestFlight overview](https://developer.apple.com/help/app-store-connect/test-a-beta-version/testflight-overview/)). Choose "Manually release this version" to hold an approved build until you are ready ([release options](https://developer.apple.com/help/app-store-connect/manage-your-apps-availability/select-an-app-store-version-release-option/)).
+</TabItem>
+<TabItem label="React Native">
+```sh
+# Native binary: built, submitted, then staged by the two stores as above.
+eas build --platform all --profile production --auto-submit
+
+# JavaScript-only fix for builds that are already installed:
+eas update --channel production --message "Fix cart crash" --rollout-percentage 10
+eas update:edit        # raise the percentage
+eas update:rollback    # return to the previous update or the embedded bundle
+```
+A React Native app has two release channels. The native binary goes through the stores with the staged rollouts from the other tabs. The JavaScript bundle and assets can be replaced with Expo Update, which has its own percentage rollout and rollback ([rollouts](https://docs.expo.dev/eas-update/rollouts/), [rollbacks](https://docs.expo.dev/eas-update/rollbacks/)). The app checks for an update on launch, downloads it and runs it on the following launch by default ([deploy updates](https://docs.expo.dev/eas-update/deployment/)). Each update carries a runtime version, and a build only accepts updates with the same one. The `fingerprint` policy derives it from a hash of the project's native code, so an update built against different native code cannot reach an old binary ([runtime versions](https://docs.expo.dev/eas-update/runtime-versions/)). The Friday hotfix from the opening was published with a hand-written runtime version that nobody had bumped. Microsoft's CodePush did the same job before App Center was retired on March 31, 2025 ([App Center retirement](https://learn.microsoft.com/en-us/appcenter/retirement)).
+</TabItem>
+<TabItem label="Flutter">
+```sh
+flutter build appbundle --release --obfuscate --split-debug-info=build/symbols
+flutter build ipa --release --obfuscate --split-debug-info=build/symbols
+# Upload with fastlane or the store tools, then stage the rollout in each console.
+
+# Optional and third party: a Dart-only patch for a release built with Shorebird.
+shorebird release android
+shorebird patch android --release-version 4.2.0+420 --rollout 10
+```
+Flutter compiles Dart to machine code ahead of time ([runtime anatomy](/foundations/runtime-anatomy/#flutter)), so the framework has no over-the-air update of its own, and the standard path is the two store rollouts ([continuous delivery with Flutter](https://docs.flutter.dev/deployment/cd)). Shorebird is a commercial service that ships a modified Flutter engine able to run patched Dart code through an interpreter. A patch can go to a percentage of devices and can be rolled back from its console ([create a patch](https://docs.shorebird.dev/code-push/patch/), [roll back a patch](https://docs.shorebird.dev/code-push/rollback/)). A patch changes Dart code only. Plugins, native code and the Flutter version need a store release.
+</TabItem>
+<TabItem label="KMP / CMP">
+```sh
+./gradlew :composeApp:bundleRelease        # Android App Bundle -> Play Console
+xcodebuild -project iosApp/iosApp.xcodeproj -scheme iosApp \
+  -configuration Release archive -archivePath build/iosApp.xcarchive   # -> App Store Connect
+```
+Kotlin compiles to bytecode on Android and to machine code on iOS, so a KMP or CMP app has no over-the-air path and uses the store mechanisms from the Android and iOS tabs. The shared module is built into both apps from the same commit, which makes the release train a two-store train: one branch cut, two builds, two reviews that finish at different times. Hold the faster store with managed publishing or manual release if both platforms must go live together. A team that shares only logic and releases the two apps on separate schedules should treat the shared module as a library with its own version.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+An over-the-air update is tested against one native binary and delivered to every binary that accepts its runtime version. Derive the runtime version from the native code instead of typing it by hand, send every update to a small percentage first, and watch the crash rate of each native version separately. Old binaries are the ones that break.
+</Aside>
+
+## Automating the train
+
+A release has many small steps: bump the version, build, sign, upload, attach release notes, submit, raise the rollout. Each one done by hand is a place to make a mistake on a hotfix day.
+
+| Job | Common tools |
+| --- | --- |
+| Build, sign and upload both platforms | [fastlane](https://docs.fastlane.tools/), Gradle Play Publisher, Xcode Cloud, Expo Build |
+| Run the pipeline | Any CI service. Expo Workflows for Expo projects |
+| Raise or halt a rollout | Play Developer API, App Store Connect API, both callable from CI |
+| Decide whether to raise | Crash and metric dashboards filtered by app version |
+
+Per-stack release commands are in the [toolkits](/toolkits/overview/#quality-and-release-tools).
+
+## Trade-offs and scale
+
+**Train length.** A weekly or two-weekly train keeps each release small, which makes a regression easier to find. A longer train batches more changes and more risk into each release. Short trains depend on flags and on automated tests ([testing strategy](/shipping/testing/)), because nobody can manually retest the whole app every week.
+
+**A named owner per release.** Large teams rotate a release captain who cuts the branch, approves which fixes may enter it, watches the rollout numbers and decides on a halt. Without an owner, every team assumes another team is watching.
+
+**Hotfix criteria.** Decide in advance which problems justify a hotfix: a crash on a main flow, data loss, a security hole, a payment failure. A wrong colour waits for the next train. Every hotfix also bypasses most of the beta period, so it carries its own risk.
+
+**Rollout speed against detection.** A stage needs enough sessions to show a problem. A crash that affects 1 in 200 users is invisible in a 1% rollout of a small app. Apps with few users gain little from tiny first stages and should watch the first day at 10% or 20% closely.
+
+**Over-the-air updates change the rules for some stacks only.** A React Native team can fix most bugs within an hour, which tempts it to test less. The native layer still has the slow path, and an over-the-air mistake reaches users faster than a store mistake. The stores permit fixes and improvements this way. Both policies cited above forbid changing what the app is for.
+
+**Release freezes.** Holiday weeks and large sales events have high traffic and few engineers at work. Most teams stop releasing a few days before, and keep the flags and server-side remedies ready.
+
+<NoDumbQuestions>
+<dt>Can I put the previous version back in the store?</dt>
+<dd>You can rebuild the previous code with a higher version number and submit it. On Play, halting a fully rolled-out release makes the previous version available again to users who have not updated. Neither store downgrades an installed app.</dd>
+
+<dt>Does pausing a phased release stop users from getting the build?</dt>
+<dd>It stops automatic updates. Users who open the App Store page can still update by hand, and new users who install the app get the newest version.</dd>
+
+<dt>Is over-the-air updating allowed by the stores?</dt>
+<dd>For interpreted code, within limits. Apple's agreement and Google's policy both allow it when the update does not change the purpose of the app or bypass platform security. JavaScript bundles qualify. Shorebird documents how its interpreter approach fits the same clauses (<a href="https://docs.shorebird.dev/code-push/guides/code-push-guide/">code push guide</a>).</dd>
+
+<dt>How long should a staged rollout take?</dt>
+<dd>Long enough for each stage to produce data you would act on. Apple's schedule is seven days. Many Android teams mirror it so both platforms can be compared day by day.</dd>
+
+<dt>Should the version number mean anything?</dt>
+<dd>Users see the version name, such as 4.2.0. The stores order builds by an integer or a build string that must increase with every upload. Generate that number in CI, and tag the commit with it so a crash report can be matched to source.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Internal testing | Internal test track | TestFlight internal testers | Both, or a preview build from Expo Build | Both | Both |
+| Public beta | Closed and open test tracks | TestFlight external testers | Both | Both | Both |
+| Staged rollout | Any percentage you set | Phased release, fixed 7-day schedule | Stores for the binary, `--rollout-percentage` for updates | Stores, or Shorebird `--rollout` | Stores |
+| Stop a rollout | Halt | Pause, up to 30 days | Stores, plus `eas update:rollback` | Stores, plus Shorebird rollback | Stores |
+| Hold an approved build | Managed publishing | Manual release | Both | Both | Both |
+| Urgent review | No separate channel | Expedited review request | Same as native | Same as native | Same as native |
+| Update without the store | No | No | Expo Update | Shorebird (third party) | No |
+| Compatibility key for updates | n/a | n/a | Runtime version | Release version | n/a |
+| Build number | `versionCode` | `CFBundleVersion` | Set by Expo Build per platform | `version: 4.2.0+420` in `pubspec.yaml` | Both native fields |
+
+<Exercise>
+Your team ships a food delivery app in React Native. On Tuesday at 18:00 the dashboard shows that version 5.1.0, at 20% on both stores since Monday, cannot complete orders paid by gift card. The cause is a JavaScript bug in the new gift card screen. The screen is behind a remote flag. Write the order of actions for the next hour and for the next week.
+
+<Fragment slot="answer">
+In the next ten minutes:
+
+1. Turn the gift card flag off. Users fall back to the old payment screen on their next config fetch. Confirm on a test device.
+2. Halt the Play rollout and pause the App Store phased release, so no more users receive 5.1.0 while the cause is being confirmed.
+
+In the next hour:
+
+3. Fix the JavaScript bug and publish it with Expo Update to 10% of the 5.1.0 runtime version. Watch order completion for that group, then raise it to 100%.
+4. Leave the flag off until the update has reached most 5.1.0 users. A user who has not received the update yet would otherwise get the broken screen back.
+
+In the next week:
+
+5. Resume both store rollouts. The binary did not change, so no new review is needed.
+6. Include the fix in the next train's binary, so new installs start with it embedded.
+7. Add the gift card payment to the end-to-end tests that run on the release candidate.
+
+No hotfix release was needed, because the bug was in JavaScript and behind a flag. If the bug had been in a native module, steps 1 and 2 would be the same, step 3 would become a hotfix build and a store review, and the fix would reach users over days.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** compiles to native code and releases through the stores only.
+- **Ionic / Capacitor** apps run web code in a WebView, so the web assets can be replaced over the air by a live update service under the same store rules as React Native.
+- **Lynx** loads its bundles through the host app, which can fetch them from a server.
+
+## Sources
+
+- Stores: [App Review](https://developer.apple.com/distribute/app-review/), [Request an expedited review](https://developer.apple.com/help/app-review/after-submitting-for-review/request-expedited-review/), [Release a version update in phases](https://developer.apple.com/help/app-store-connect/update-your-app/release-a-version-update-in-phases/), [App Store version release options](https://developer.apple.com/help/app-store-connect/manage-your-apps-availability/select-an-app-store-version-release-option/), [TestFlight overview](https://developer.apple.com/help/app-store-connect/test-a-beta-version/testflight-overview/), [App Store Connect API: phased releases](https://developer.apple.com/documentation/appstoreconnectapi/app-store-version-phased-releases), [Play staged rollouts](https://support.google.com/googleplay/android-developer/answer/6346149), [Halting a fully rolled-out release](https://support.google.com/googleplay/android-developer/answer/16285429), [Managed publishing](https://support.google.com/googleplay/android-developer/answer/9859654), [Play Developer API: APKs and tracks](https://developers.google.com/android-publisher/tracks), [I/O 2025: What's new in Google Play](https://android-developers.googleblog.com/2025/05/io-2025-whats-new-in-google-play.html)
+- Policy: [Apple Developer Program License Agreement](https://developer.apple.com/support/terms/apple-developer-program-license-agreement/) (section 3.3.1(B)), [Google Play device and network abuse policy](https://support.google.com/googleplay/android-developer/answer/16559646)
+- React Native: [Deploy updates](https://docs.expo.dev/eas-update/deployment/), [Rollouts](https://docs.expo.dev/eas-update/rollouts/), [Rollbacks](https://docs.expo.dev/eas-update/rollbacks/), [Runtime versions](https://docs.expo.dev/eas-update/runtime-versions/), [App Center retirement](https://learn.microsoft.com/en-us/appcenter/retirement)
+- Flutter: [Continuous delivery with Flutter](https://docs.flutter.dev/deployment/cd), [Shorebird code push guide](https://docs.shorebird.dev/code-push/guides/code-push-guide/), [Create a patch](https://docs.shorebird.dev/code-push/patch/), [Roll back a patch](https://docs.shorebird.dev/code-push/rollback/)
+- Tools: [fastlane](https://docs.fastlane.tools/)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 2 (mistakes are hard to revert) and ch. 9 (CI/CD and the build train)

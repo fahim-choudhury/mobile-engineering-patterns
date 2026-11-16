@@ -1,0 +1,325 @@
+---
+title: Testing strategy
+description: How to split mobile tests into fast host-side tests, screen tests, screenshot tests and a few end-to-end journeys, with the test frameworks and a state holder test in each stack.
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+Two teams work on the same banking app.
+
+- The payments team has 1,900 end-to-end tests. A run takes three hours, and about one run in ten fails for a reason unrelated to the change. Engineers press "retry" until it passes.
+- The onboarding team has unit tests with a mock for every dependency. The suite is green. The sign-up screen has been broken for German users with large text for two releases.
+- Before each release, four people spend two days tapping through a spreadsheet of 300 manual checks.
+- A test that passed on the emulator fails on a Samsung phone, where the keyboard covers the button.
+
+Both teams test a lot. Neither can answer the question a test suite exists for: is this build safe to roll out?
+
+<BrainPower>
+You may run ten end-to-end tests on every pull request, and no more. Which ten user journeys in your app get them? What happens to everything else?
+</BrainPower>
+
+## Constraints on a phone
+
+- **UI tests need a device.** An emulator or simulator takes time to boot, and each test that drives the full app takes seconds to minutes. Animations, the keyboard, network timing and system dialogs make these tests fail at random.
+- **You cannot own every device.** Screen sizes, OS versions and manufacturer changes multiply. A device farm runs tests on real hardware and is slow and billed by the minute.
+- **The OS controls the hard parts.** Permission dialogs, push delivery, process death, backgrounding and low memory are the source of many real bugs and the hardest things to script.
+- **iOS tests need a Mac.** macOS CI runners cost more than Linux ones, which limits how many simulator tests a team can afford per pull request.
+- **A release cannot be recalled.** A bug found after rollout takes days to fix for everyone ([releases you can't roll back](/shipping/releases/)). This raises the value of tests. Staged rollouts and flags are the second net, so tests do not have to catch everything.
+
+## The pattern
+
+Put each check at the lowest layer that can catch the bug.
+
+```d2
+classes: {
+  e2e: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  ui: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  unit: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 4
+grid-columns: 4
+grid-gap: 10
+h1: "Layer" { class: head }
+h2: "Runs on" { class: head }
+h3: "Speed" { class: head }
+h4: "How many" { class: head }
+a1: "End-to-end\njourney" { class: e2e }
+a2: "Real build on a\ndevice or emulator" { class: e2e }
+a3: "Minutes" { class: e2e }
+a4: "About ten" { class: e2e }
+b1: "Screen and\nscreenshot" { class: ui }
+b2: "Host machine, or\nemulator for some" { class: ui }
+b3: "Seconds" { class: ui }
+b4: "One set\nper screen" { class: ui }
+c1: "Unit: logic and\nstate holders" { class: unit }
+c2: "Host machine" { class: unit }
+c3: "Milliseconds" { class: unit }
+c4: "Thousands" { class: unit }
+```
+
+1. **Unit tests for logic and state holders.** Reducers, view models, repositories, parsers, formatters. They run on the development machine without a device.
+2. **Screen tests with fake state.** Render one screen with a given state and assert what the user would see and can tap. No network, no database.
+3. **Screenshot tests for appearance.** Render the screen in several configurations (dark mode, large text, a long language, right-to-left) and compare against stored images ([localization and accessibility](/core-patterns/localization-accessibility/)).
+4. **A few end-to-end journeys.** Sign in, the main purchase or core action, and whatever would be an incident if it broke. They run against a real build.
+5. **Manual exploration for what scripts miss.** New features, odd devices, interruptions. A beta track and a staged rollout extend this to real users.
+
+The earlier chapters already made the app testable. State flows one way through a state holder with no UI in it ([state management](/core-patterns/state-management/)). Dependencies are passed in, so a test passes a fake ([dependency injection](/core-patterns/dependency-injection/)). Time and threads are injected, so a test controls them ([concurrency](/foundations/concurrency/)).
+
+### Fakes before mocks
+
+A fake is a small working implementation: a repository backed by a list in memory. A mock is an object configured per test to expect certain calls and return canned values. Android's testing guide and Google's testing book both recommend fakes where possible ([test doubles in Android](https://developer.android.com/training/testing/fundamentals/test-doubles), [Software Engineering at Google, ch. 13](https://abseil.io/resources/swe-book/html/ch13.html)). A test built on mocks checks that the code calls what the test author expected, and keeps passing when that expectation is wrong, as the onboarding team found. One fake per interface, maintained next to the real implementation, serves every test.
+
+## A state holder test in each stack
+
+The same test in each stack: given a repository with one order, the orders screen ends up showing it.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+class OrdersViewModelTest {
+    @get:Rule
+    val mainDispatcherRule = MainDispatcherRule()   // replaces Dispatchers.Main with a test dispatcher
+
+    @Test
+    fun `shows orders from the repository`() = runTest {
+        val viewModel = OrdersViewModel(FakeOrdersRepository(listOf(order1001)))
+
+        viewModel.state.test {
+            assertEquals(OrdersState.Loading, awaitItem())
+            assertEquals(OrdersState.Content(listOf(order1001)), awaitItem())
+        }
+    }
+}
+```
+This is a local test: it runs on the JVM of the development machine. `runTest` from `kotlinx-coroutines-test` skips delays and fails on uncaught exceptions ([testing coroutines on Android](https://developer.android.com/kotlin/coroutines/test)). `test { }` is Turbine, which collects a `Flow` and lets the test await each value ([Turbine](https://github.com/cashapp/turbine)). `MainDispatcherRule` is a small rule from the Android guide that you copy into the project. Compose screens are tested with `createComposeRule()` and semantics matchers such as `onNodeWithText` ([testing in Compose](https://developer.android.com/develop/ui/compose/testing)). Robolectric runs those on the JVM as well, without an emulator ([Robolectric](https://robolectric.org/)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+import Testing
+@testable import Shop
+
+@MainActor
+struct OrdersModelTests {
+    @Test func showsOrdersFromRepository() async {
+        let model = OrdersModel(repository: FakeOrdersRepository(orders: [.order1001]))
+
+        await model.load()
+
+        #expect(model.state == .content([.order1001]))
+    }
+
+    @Test(arguments: [URLError(.notConnectedToInternet), URLError(.timedOut)])
+    func showsRetryOnNetworkErrors(error: URLError) async {
+        let model = OrdersModel(repository: FakeOrdersRepository(error: error))
+
+        await model.load()
+
+        #expect(model.state == .failed(canRetry: true))
+    }
+}
+```
+Swift Testing is the unit test framework for new code: `@Test` marks a function, `#expect` shows both sides of a failed comparison, and `arguments:` runs one test over several inputs ([Swift Testing](https://developer.apple.com/documentation/testing)). Tests run in parallel by default, so shared global state shows up quickly. UI tests still use XCTest with XCUIAutomation, which drives the app from a separate process through its accessibility elements ([XCUIAutomation](https://developer.apple.com/documentation/xcuiautomation)). SwiftUI has no first-party API for rendering a single view in a unit test, so teams test the `@Observable` model, as here, and use snapshot tests for the views.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import { render, screen, userEvent } from '@testing-library/react-native';
+
+test('shows orders from the repository', async () => {
+  await render(<OrdersScreen repository={fakeRepository([order1001])} />);
+
+  expect(await screen.findByText('Order #1001')).toBeOnTheScreen();
+});
+
+test('opens the order when its row is pressed', async () => {
+  const onOpen = jest.fn();
+  await render(<OrdersScreen repository={fakeRepository([order1001])} onOpen={onOpen} />);
+
+  await userEvent.setup().press(await screen.findByRole('button', { name: /Order #1001/ }));
+
+  expect(onOpen).toHaveBeenCalledWith('1001');
+});
+```
+Jest runs the tests in Node with the `jest-expo` preset ([unit testing with Jest](https://docs.expo.dev/develop/unit-testing/)). React Native Testing Library renders components without a device and finds elements the way a user or a screen reader would: by text, role and label. In version 14, `render` is asynchronous ([React Native Testing Library](https://oss.callstack.com/react-native-testing-library/), [migration to 14.x](https://oss.callstack.com/react-native-testing-library/docs/start/migration-v14)). Native modules do not exist in Node and are replaced by Jest mocks, so anything that depends on real native behaviour needs an end-to-end test. Hooks and stores with no UI are tested as plain TypeScript.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+void main() {
+  testWidgets('shows orders from the repository', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: OrdersScreen(repository: FakeOrdersRepository([order1001])),
+      ),
+    );
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+
+    await tester.pump();   // let the future complete and rebuild
+
+    expect(find.text('Order #1001'), findsOneWidget);
+  });
+
+  testWidgets('matches the stored image', (tester) async {
+    await tester.pumpWidget(MaterialApp(home: OrdersScreen(repository: FakeOrdersRepository([order1001]))));
+    await tester.pumpAndSettle();
+    await expectLater(find.byType(OrdersScreen), matchesGoldenFile('goldens/orders.png'));
+  });
+}
+```
+Flutter's test tool has three layers built in: unit tests, widget tests and integration tests ([testing Flutter apps](https://docs.flutter.dev/testing/overview)). A widget test builds real widgets in a headless environment on the development machine, with a fake clock that the test advances with `pump`. Because Flutter draws its own pixels, the same environment can render an image, and `matchesGoldenFile` compares it with a stored one ([matchesGoldenFile](https://api.flutter.dev/flutter/flutter_test/matchesGoldenFile.html)). The `integration_test` package runs the same `WidgetTester` API against the full app on a device ([integration tests](https://docs.flutter.dev/testing/integration-tests)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// shared/src/commonTest
+class OrdersViewModelTest {
+    @BeforeTest fun setUp() = Dispatchers.setMain(StandardTestDispatcher())
+    @AfterTest fun tearDown() = Dispatchers.resetMain()
+
+    @Test
+    fun showsOrdersFromRepository() = runTest {
+        val viewModel = OrdersViewModel(FakeOrdersRepository(listOf(order1001)))
+
+        advanceUntilIdle()
+
+        assertEquals(OrdersState.Content(listOf(order1001)), viewModel.state.value)
+    }
+}
+```
+Tests in `commonTest` use `kotlin.test` and run once per target: on the JVM for Android, and as a native binary on the iOS simulator ([test your multiplatform app](https://kotlinlang.org/docs/multiplatform/multiplatform-run-tests.html)). `./gradlew allTests` runs every target. Running the shared tests on iOS matters, because Kotlin/Native differs from the JVM in threading and in platform implementations behind `expect` declarations. Compose Multiplatform has a common UI test API, `runComposeUiTest`, with the same finders and assertions as Jetpack Compose ([testing Compose Multiplatform UI](https://kotlinlang.org/docs/multiplatform/compose-test.html)). Fakes live in a shared test fixtures source set so both platforms' tests use them.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+A test that fails one run in ten and is retried until green has stopped protecting you, because a real failure now looks like the usual noise. When a test becomes flaky, move it out of the blocking suite the same day, assign it an owner, and fix or delete it. The usual causes are a real network, animations, state left by another test, and waiting for a fixed time where the test should wait for a condition.
+</Aside>
+
+## Screen, screenshot and end-to-end tools
+
+| Layer | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Unit | JUnit, coroutines-test, Turbine | Swift Testing | Jest | `flutter test` | `kotlin.test` |
+| Screen | Compose UI test, Robolectric | XCUITest | React Native Testing Library | Widget tests | `runComposeUiTest` |
+| Screenshot | Compose Preview Screenshot Testing, Roborazzi | swift-snapshot-testing | Screenshots from end-to-end runs | Golden tests | Roborazzi |
+| End-to-end | Compose UI test, UI Automator, Maestro | XCUITest, Maestro | Maestro, Detox | `integration_test`, Maestro, Patrol | Per platform, Maestro |
+| Devices in CI | Gradle Managed Devices, device farm | Simulators on macOS runners, Xcode Cloud | Both | Both | Both |
+
+Android's first-party screenshot tool turns Compose previews into tests. It is still in alpha and is moving from its own Gradle plugin into the Android Gradle Plugin's test suites ([Compose Preview Screenshot Testing](https://developer.android.com/studio/preview/compose-screenshot-testing)). Roborazzi renders on the JVM through Robolectric ([Roborazzi](https://github.com/takahirom/roborazzi)). On iOS, the common choice is Point-Free's library ([swift-snapshot-testing](https://github.com/pointfreeco/swift-snapshot-testing)). Screenshot images depend on the renderer, so generate and compare them on the same OS image in CI.
+
+Maestro appears in every column because it drives the installed app from outside, through the accessibility tree, and does not care what the app is written in ([Maestro](https://docs.maestro.dev/)). A flow is a YAML file:
+
+```yaml
+appId: com.example.shop
+---
+- launchApp:
+    clearState: true
+- tapOn: "Sign in"
+- tapOn: "Email"
+- inputText: "test@example.com"
+- tapOn: "Continue"
+- tapOn: "Add to cart"
+- tapOn: "Checkout"
+- assertVisible: "Order placed"
+```
+
+Its README lists emulators, simulators and physical Android devices as targets, and states that physical iOS devices are not supported yet ([Maestro on GitHub](https://github.com/mobile-dev-inc/maestro)). For real iPhones, use XCUITest on a device farm.
+
+Gradle Managed Devices let the build create and run emulators with a fixed configuration ([Gradle Managed Devices](https://developer.android.com/studio/test/gradle-managed-devices)). Firebase Test Lab, long the default farm for Android, is deprecated and shuts down on September 30, 2027, with Google's Developer Device Platform as the documented replacement ([Test Lab migration guide](https://firebase.google.com/docs/test-lab/migrate)).
+
+## A pipeline that uses the layers
+
+| Stage | Runs | Target time |
+| --- | --- | --- |
+| Every pull request | Lint, unit tests, screen tests, screenshot comparison, for the modules that changed | Under 10 minutes |
+| After merge to main | Full unit and screen suites, the end-to-end journeys on one emulator and one simulator | Under 30 minutes |
+| Nightly | End-to-end journeys on a matrix of real devices and OS versions, performance benchmarks | Hours |
+| Release candidate | The nightly suite, manual exploration, beta distribution | Days |
+
+## Trade-offs and scale
+
+**The pyramid's shape is a cost argument.** A logic bug caught by a unit test costs milliseconds per run. The same bug caught end-to-end costs minutes and fails for other reasons too. Move a check down a layer whenever a lower layer can express it.
+
+**End-to-end tests against a real backend.** A staging backend makes tests realistic and flaky, since test data drifts and other teams deploy to it. A fake backend with recorded responses is stable and can drift from the real API. Many teams run journeys against a fake on pull requests and against staging nightly, and add contract tests between app and backend ([old app versions](/shipping/old-versions/)).
+
+**Test the states the OS creates.** Process death and restore ([app lifecycle](/foundations/app-lifecycle/)), a denied permission, no network, rotation and large font size cause a large share of production bugs. Android's "Don't keep activities" developer option and `StateRestorationTester` in Compose cover restore. Screenshot tests cover font size and rotation cheaply.
+
+**Flags double paths.** Test a flagged feature with the flag on and off through the injected flag interface, and remove the old path's tests with the flag ([feature flags](/shipping/feature-flags/)).
+
+**Coverage numbers.** Line coverage shows what no test touches. A high number says nothing about whether the assertions are meaningful. Use it to find untested modules, and do not set it as a target per file.
+
+**Large codebases.** With hundreds of modules, running everything on each pull request is too slow. Build tools can select the tests affected by a change from the module graph ([modularization](/core-patterns/dependency-injection/#modularization-the-pattern)), and device tests are split across parallel emulators.
+
+**Accessibility checks ride along.** Compose UI tests can run automated accessibility checks, XCUITest has `performAccessibilityAudit()`, and Flutter has `meetsGuideline` ([localization and accessibility](/core-patterns/localization-accessibility/)). Tests that find elements by role and label also fail when the labels are missing.
+
+**Manual testing does not go to zero.** The 300-row spreadsheet should shrink as journeys are automated. Exploratory testing of new features on real devices, and internal use of the beta build, find the problems nobody thought to script.
+
+<NoDumbQuestions>
+<dt>Should I test on emulators or real devices?</dt>
+<dd>Emulators and simulators for the pull request loop, since they are cheap and reproducible. Real devices nightly and before release, since manufacturer changes, real GPUs, keyboards and performance only appear there.</dd>
+
+<dt>Is a snapshot test of a React Native component tree a screenshot test?</dt>
+<dd>No. Jest's snapshot is a text serialization of the component tree. It detects structural changes and cannot detect that two views overlap. A pixel screenshot needs the app rendered on a device or simulator.</dd>
+
+<dt>How do I test code that depends on the current time?</dt>
+<dd>Inject a clock. Coroutine tests and Flutter widget tests have virtual time built in. In Swift, pass a `Clock`. In Jest, use fake timers.</dd>
+
+<dt>Do I write UI tests for every screen?</dt>
+<dd>A screen test with fake state for each screen with behaviour is affordable, since it runs in seconds on the host. Full end-to-end tests are for journeys, and one journey crosses many screens.</dd>
+
+<dt>What about testing in-app purchases, push and deep links?</dt>
+<dd>Each has a system test hook. StoreKit configuration files and Play license testers simulate purchases (<a href="/shipping/in-app-purchases/">in-app purchases</a>), `xcrun simctl push` and the FCM API send test pushes, and both platforms open a deep link from the command line. Test the parsing and routing logic below the UI, and one journey end to end.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Test function | `@Test` (JUnit) | `@Test` (Swift Testing) | `test()` | `test()`, `testWidgets()` | `@Test` (`kotlin.test`) |
+| Assertion | `assertEquals`, Truth | `#expect`, `#require` | `expect().toBe()` | `expect(actual, matcher)` | `assertEquals` |
+| Async test | `runTest { }` | `async` test function | `async` test function | `async` body, `tester.pump()` | `runTest { }` |
+| Virtual time | `StandardTestDispatcher`, `advanceTimeBy` | Injected `Clock` | `jest.useFakeTimers()` | `tester.pump(duration)` | `StandardTestDispatcher` |
+| Find a UI element | `onNodeWithText`, `onNodeWithTag` | `app.buttons["Pay"]` | `screen.getByRole` | `find.text`, `find.byKey` | `onNodeWithText` |
+| Stable test ID | `Modifier.testTag` | `accessibilityIdentifier` | `testID` | `Key` | `Modifier.testTag` |
+| Run on host without a device | Local tests, Robolectric | Unit tests still use a simulator or macOS | Jest in Node | `flutter test` | JVM target tests |
+| Run on device | Instrumented tests | XCUITest | Maestro, Detox | `integration_test` | Instrumented tests, XCUITest |
+| Parameterized test | `@ParameterizedTest`, `TestParameterInjector` | `@Test(arguments:)` | `test.each` | Loop over `test()` | Loop, or per-target libraries |
+
+<Exercise>
+For each bug, name the lowest layer that would have caught it and the test you would write.
+
+1. A discount of 100% produces a negative total.
+2. The "Pay" button is hidden behind the keyboard on small phones.
+3. After the process is killed in the background, the checkout form comes back empty.
+4. The German translation of "Continue" is cut off at the largest font size.
+5. The app sends the order twice when the user double-taps "Pay".
+6. Sign-in fails on the release build because R8 removed a class that is used through reflection.
+
+<Fragment slot="answer">
+1. Unit test on the price calculation, with table-driven cases for 0%, 100% and values above 100%.
+2. Screenshot or screen test with the keyboard shown on a small screen configuration. If the stack cannot show a keyboard on the host, an end-to-end step that types into the last field and then taps "Pay".
+3. A state restoration test: `StateRestorationTester` on Compose, relaunching with saved state in XCUITest, or a state holder test that saves and restores its state. This is a screen-level test, with no end-to-end run needed.
+4. Screenshot test of that screen in German at the largest font scale.
+5. Unit test on the state holder: two "pay" events in a row produce one repository call. The idempotency key ([networking](/core-patterns/networking/#retries-and-idempotency)) is tested on the repository with a fake API.
+6. Only a test that runs the release build catches this: an end-to-end sign-in journey against the minified, signed build. This is the argument for running the ten journeys on the release configuration.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** uses xUnit or NUnit for logic and Appium for UI tests.
+- **Ionic / Capacitor** tests web code with web tools such as Vitest and Playwright, and uses Appium or Maestro for the packaged app.
+- **Lynx** has a testing library modelled on React Testing Library for components, and relies on the host app's tools for end-to-end tests.
+
+## Sources
+
+- Concepts: [Test doubles in Android](https://developer.android.com/training/testing/fundamentals/test-doubles), [Software Engineering at Google, ch. 13: Test doubles](https://abseil.io/resources/swe-book/html/ch13.html)
+- Android: [Fundamentals of testing Android apps](https://developer.android.com/training/testing/fundamentals), [Testing coroutines on Android](https://developer.android.com/kotlin/coroutines/test), [Testing in Compose](https://developer.android.com/develop/ui/compose/testing), [Compose Preview Screenshot Testing](https://developer.android.com/studio/preview/compose-screenshot-testing) (alpha), [Gradle Managed Devices](https://developer.android.com/studio/test/gradle-managed-devices), [Robolectric](https://robolectric.org/), [Turbine](https://github.com/cashapp/turbine), [Roborazzi](https://github.com/takahirom/roborazzi), [Migrate from Firebase Test Lab](https://firebase.google.com/docs/test-lab/migrate)
+- iOS: [Swift Testing](https://developer.apple.com/documentation/testing), [XCUIAutomation](https://developer.apple.com/documentation/xcuiautomation), [swift-snapshot-testing](https://github.com/pointfreeco/swift-snapshot-testing)
+- React Native: [Unit testing with Jest](https://docs.expo.dev/develop/unit-testing/), [React Native Testing Library](https://oss.callstack.com/react-native-testing-library/) (14.x), [Migration to 14.x](https://oss.callstack.com/react-native-testing-library/docs/start/migration-v14)
+- Flutter: [Testing Flutter apps](https://docs.flutter.dev/testing/overview), [Integration tests](https://docs.flutter.dev/testing/integration-tests), [matchesGoldenFile](https://api.flutter.dev/flutter/flutter_test/matchesGoldenFile.html)
+- KMP: [Test your multiplatform app](https://kotlinlang.org/docs/multiplatform/multiplatform-run-tests.html), [Testing Compose Multiplatform UI](https://kotlinlang.org/docs/multiplatform/compose-test.html)
+- End-to-end: [Maestro documentation](https://docs.maestro.dev/), [Maestro on GitHub](https://github.com/mobile-dev-inc/maestro)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 17 (automated testing) and ch. 18 (manual testing)

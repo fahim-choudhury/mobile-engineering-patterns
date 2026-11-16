@@ -1,0 +1,302 @@
+---
+title: Feature flags and experimentation
+description: How to ship code switched off, turn it on for a percentage of users, run an A/B test and remove the flag afterwards, with defaults, caching and typed access in each stack.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A travel app starts using feature flags for its new booking flow. The reports that follow:
+
+- On first launch after install, users see the old home screen for a second and then the new one replaces it.
+- A user is on step 3 of the new booking flow when the flag is turned off. Step 4 belongs to the old flow and has none of the data they entered.
+- The experiment dashboard shows the new flow winning by 9%. The new flow logged "user entered experiment" on its first screen, and the old flow logged it at app start, so the two groups were never comparable.
+- An engineer cleaning up the console turns off a flag from 2023. It was the only thing keeping a retired payment provider's code path disabled.
+
+Each of these is a flag system that works as designed and was used without rules.
+
+<BrainPower>
+Your flags come from the network, and the request takes 800 ms on a slow connection. The first screen depends on a flag. What does the app render during those 800 ms, and what does it render on a plane with no connection?
+</BrainPower>
+
+## Constraints on a phone
+
+- **A release cannot be rolled back.** A flag is the fastest way to disable shipped code ([releases you can't roll back](/shipping/releases/)).
+- **The app starts before the network answers.** Flag values must be available from disk, or from defaults compiled into the binary, at the first frame.
+- **Sessions are long and processes die.** A value can change on the server while the user is in the middle of a flow, and the process can be killed and restored in the same flow ([app lifecycle](/foundations/app-lifecycle/)).
+- **Old versions keep asking.** A flag is evaluated by every version that contains it, for as long as those versions run ([old app versions](/shipping/old-versions/)).
+- **The binary is public.** Code and strings behind a runtime flag are in the app that anyone can download and inspect ([security and privacy](/shipping/security-privacy/)).
+
+## Kinds of flag
+
+Pete Hodgson's article on feature toggles sorts them by how long they live and who changes them ([Feature Toggles](https://martinfowler.com/articles/feature-toggles.html)). The same categories apply on mobile:
+
+| Kind | Purpose | Lifetime | Changed by |
+| --- | --- | --- | --- |
+| Release flag | Merge and ship unfinished work switched off, then roll it out | Weeks. Removed after 100% | The feature team |
+| Experiment | Compare variants on randomly assigned users | The length of the test | The feature team, with a data analyst |
+| Kill switch | Turn off a risky or costly feature during an incident | Permanent | Whoever is on call |
+| Remote config | Tune a value: timeouts, limits, copy, a minimum app version | Permanent | Product or operations |
+| Entitlement | Enable a feature for a plan, a country or a set of accounts | Permanent | The backend, from account data |
+
+Mixing the kinds causes the cleanup accident from the opening: a kill switch looked like a forgotten release flag.
+
+## The pattern
+
+1. **Compile a default into the app for every flag.** The default is the safe value: the old behaviour for a release flag, "enabled" for a kill switch.
+2. **Fetch, store, and activate on the next start.** The app reads the values cached by the previous session, renders with them, and downloads new values in the background for the next cold start. Values stay the same for the whole session.
+3. **Read flags through one typed interface.** Screens ask `flags.newCheckout`. The string key, the provider SDK and the default appear in one file. The interface is injected, so a test passes a fake ([dependency injection](/core-patterns/dependency-injection/)).
+4. **Let the server decide who gets what.** Targeting rules use app version, platform, country and a percentage. The percentage is computed from a hash of a stable user or install ID, so a user stays in the same group every time.
+5. **Record exposure where the variants diverge.** An experiment logs the assignment at the moment the user reaches the first point that differs, in both variants, in the same place in the code.
+6. **Give every flag an owner, a kind and an end date.** A release flag has a ticket for its own removal.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  disk: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App" { class: app }
+cache: "Flag cache\non disk" { class: disk }
+service: "Flag service" { class: srv }
+app -> cache: "1. activate values\nfrom the last session" { style.font-size: 16 }
+cache -> app: "2. values, or compiled\ndefaults on first launch" { style.font-size: 16 }
+app -> app: "3. render the first frame" { style.font-size: 16 }
+app -> service: "4. fetch in the background\n(user ID, app version)" { style.font-size: 16 }
+service -> cache: "5. store for the\nnext cold start" { style.font-size: 16 }
+```
+
+This answers the Brain Power question. During the 800 ms and on the plane, the app renders with the cached values, and with the compiled defaults on the very first launch. The flicker in the opening came from applying fetched values to a screen that was already visible.
+
+## A typed flag in each stack
+
+Each sample uses Firebase Remote Config, which has an SDK for every stack here, and follows the "load new values for next startup" strategy from its documentation ([loading strategies](https://firebase.google.com/docs/remote-config/loading)). The shape is the same with any other provider.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+interface FeatureFlags {
+    val newCheckout: Boolean
+}
+
+class RemoteFlags(
+    private val config: FirebaseRemoteConfig = Firebase.remoteConfig,
+) : FeatureFlags {
+
+    suspend fun start() {
+        config.setDefaultsAsync(R.xml.flag_defaults).await()
+        config.activate().await()    // values fetched by the previous session
+        config.fetch()               // download for the next session, not awaited
+    }
+
+    override val newCheckout: Boolean
+        get() = config.getBoolean("new_checkout")
+}
+```
+`start()` runs before the first screen reads a flag. `activate()` reads from disk and does not use the network, so it is fast. The defaults live in an XML resource ([get started with Remote Config on Android](https://firebase.google.com/docs/remote-config/android/get-started)). Bind `FeatureFlags` to `RemoteFlags` in the Hilt graph and to a fake in tests. For a kill switch that must act within minutes, `addOnConfigUpdateListener` receives changes as they are published (SDK 21.3.0 and later), and the app then chooses a safe moment to activate them ([real-time Remote Config](https://firebase.google.com/docs/remote-config/android/real-time)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+protocol FeatureFlags: Sendable {
+    var newCheckout: Bool { get }
+}
+
+final class RemoteFlags: FeatureFlags, @unchecked Sendable {
+    private let config = RemoteConfig.remoteConfig()
+
+    func start() async {
+        config.setDefaults(["new_checkout": false as NSObject])
+        _ = try? await config.activate()         // values fetched by the previous session
+        Task { _ = try? await config.fetch() }   // download for the next session
+    }
+
+    var newCheckout: Bool { config["new_checkout"].boolValue }
+}
+```
+Call `start()` from the `App` initializer's task before showing content that depends on a flag, and pass the `FeatureFlags` value through the SwiftUI environment. Defaults can also come from a plist ([get started with Remote Config on Apple platforms](https://firebase.google.com/docs/remote-config/get-started?platform=ios)). Build-time switches use compilation conditions (`#if DEBUG`, custom flags in build settings), which remove the code from the release binary.
+</TabItem>
+<TabItem label="React Native">
+```ts
+import {
+  getRemoteConfig, setDefaults, activate, fetchConfig, getBoolean,
+} from '@react-native-firebase/remote-config';
+
+const config = getRemoteConfig();
+
+export async function startFlags() {
+  await setDefaults(config, { new_checkout: false });
+  await activate(config);        // values fetched by the previous session
+  void fetchConfig(config);      // download for the next session
+}
+
+export const flags = {
+  get newCheckout() {
+    return getBoolean(config, 'new_checkout');
+  },
+};
+```
+React Native Firebase (26.x) wraps the native Firebase SDKs and uses the same modular function style as the Firebase web SDK ([Remote Config for React Native](https://rnfirebase.io/remote-config/usage)). It contains native code, so it needs a development build. Expo's documentation lists hosted flag services with React Native SDKs, PostHog among them ([feature flag services](https://docs.expo.dev/guides/using-feature-flags/)). Keep the splash screen up until `startFlags()` resolves. It reads from disk, so the wait is short. An over-the-air update can change JavaScript without a flag, which tempts teams to skip flags. A flag changes behaviour for chosen users in minutes and an update replaces code for everyone on a runtime version, so they solve different problems.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+abstract interface class FeatureFlags {
+  bool get newCheckout;
+}
+
+class RemoteFlags implements FeatureFlags {
+  final _config = FirebaseRemoteConfig.instance;
+
+  Future<void> start() async {
+    await _config.setDefaults(const {'new_checkout': false});
+    await _config.activate();        // values fetched by the previous session
+    unawaited(_config.fetch());      // download for the next session
+  }
+
+  @override
+  bool get newCheckout => _config.getBool('new_checkout');
+}
+```
+Await `start()` in `main()` before `runApp`, and expose `FeatureFlags` through your Riverpod provider or `InheritedWidget` so widget tests can override it ([get started with Remote Config on Flutter](https://firebase.google.com/docs/remote-config/get-started?platform=flutter)). The default minimum fetch interval is 12 hours, so calling `fetch()` on every launch does not hit the network every time. Build-time values come from `--dart-define` and are read with `bool.fromEnvironment`, which lets the compiler remove the unused branch.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: screens and view models depend on this only.
+interface FeatureFlags {
+    val newCheckout: Boolean
+}
+
+class FakeFlags(override val newCheckout: Boolean = false) : FeatureFlags
+
+class CheckoutViewModel(flags: FeatureFlags) : ViewModel() {
+    // Read once when the flow starts. The flow keeps this value until it ends.
+    private val useNewCheckout = flags.newCheckout
+}
+```
+Firebase publishes no Kotlin Multiplatform SDK. The shared module declares the interface, and each platform supplies an implementation that calls its native Firebase SDK, as in the Android and iOS tabs. Two alternatives keep the implementation in common code: the community GitLive Firebase Kotlin SDK, which wraps the native SDKs ([firebase-kotlin-sdk](https://github.com/GitLiveApp/firebase-kotlin-sdk)), and the OpenFeature Kotlin SDK, a vendor-neutral client API with iOS and Android targets and providers for several flag services ([OpenFeature Kotlin SDK](https://openfeature.dev/docs/reference/sdks/client/kotlin/)).
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+A client-side flag is a preference, and a user with a modified app can flip it. Use flags to decide what to show. Enforce paid features, limits and permissions on the server, which is the only side that can refuse a request.
+</Aside>
+
+## A flag's life
+
+```d2
+classes: {
+  dev: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  roll: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  done: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 2
+grid-columns: 4
+grid-gap: 12
+a: "Create: owner,\nkind, end date,\ndefault off" { class: dev }
+b: "Merge code\nbehind it" { class: dev }
+c: "On for the team\nand beta users" { class: dev }
+d: "Released in\nversion 5.2,\nstill off" { class: roll }
+e: "1%, then 10%,\nfor versions\n5.2 and later" { class: roll }
+f: "50% as an\nexperiment" { class: roll }
+g: "100%" { class: done }
+h: "Delete the old\ncode, then\nthe flag" { class: done }
+```
+
+The last box has an order. The code that reads the flag is removed in a release first. The flag stays in the console at 100% until the versions that still read it are below your support window. Deleting it earlier sends those versions back to their compiled default, which is the old behaviour.
+
+## Experiments
+
+An A/B test is a flag whose targeting is random and whose result is measured.
+
+- **Assignment.** Users are split by a hash of their ID. The split must be independent of anything the variants change.
+- **Exposure.** Only users who reached the point where the variants differ are counted, and both groups are logged by the same line of code. The 9% win in the opening compared all app starts against first-screen visits.
+- **Metrics.** One primary metric chosen in advance, plus guardrails that must not get worse: crash rate, startup time, support contacts, revenue.
+- **Duration.** Fixed in advance from the number of users needed, and at least a full week so weekdays and weekends are both covered. Stopping on the first day the numbers look good produces false winners.
+- **Health check.** If a 50/50 split shows 52/48 exposed users, the assignment or the logging is broken and the result cannot be trusted. The name for this is sample ratio mismatch.
+
+Firebase A/B Testing runs experiments on Remote Config parameters and reads results from Google Analytics ([Remote Config experiments](https://firebase.google.com/docs/ab-testing/abtest-config)). Its rollouts feature compares the enabled group against a control group of the same size and shows Crashlytics data for both ([Remote Config rollouts](https://firebase.google.com/docs/remote-config/rollouts)).
+
+Mobile adds two complications. The variant code exists only in versions that shipped it, so the experiment targets a minimum app version and gains users at the speed of the rollout. Events are queued while the device is offline and arrive late, so results for the last days of a test keep changing for a while after it ends.
+
+Store pages have their own experiment tools, separate from in-app flags: product page optimization on the App Store ([product page optimization](https://developer.apple.com/app-store/product-page-optimization/)) and store listing experiments on Google Play ([store listing experiments](https://support.google.com/googleplay/android-developer/answer/6227309)).
+
+## Trade-offs and scale
+
+**Runtime against build-time flags.** A runtime flag can change after release, and its code ships to everyone. A build-time flag removes the code from the binary and cannot be changed afterwards. Use build-time flags for debug tools and for launches that must stay secret, because people read the strings in released binaries.
+
+**Flag debt.** Every flag doubles the number of states its code can be in. Twenty flags on one screen cannot all be tested in combination. Test the two states that matter, all release flags off (what users have today) and all on (what they will have), and delete flags on schedule. Teams add a lint rule or a CI check that fails when a release flag passes its end date.
+
+**Consistency against speed.** Activating on the next cold start keeps a session consistent and delays a change by one launch. A kill switch needs to act sooner. Use real-time updates for those, and apply the new value at a safe point such as the next screen entry. Never switch a flow under a user who is inside it.
+
+**Flags that depend on flags.** "New checkout" requires "new cart". Encode the dependency in the typed wrapper, where it can be unit tested, and keep the console rules simple.
+
+**Decide on the server when you can.** If the backend can return the right response for a user, the app needs no flag at all, and old versions get the behaviour too. Client-side flags are for differences in client code.
+
+**Buying or building.** Firebase Remote Config covers flags, rollouts and basic experiments. Dedicated services such as LaunchDarkly, Statsig and PostHog add richer targeting, audit logs and statistics. A home-built system is a config endpoint, a cache and a hashing function at first, and grows into an audit log, a targeting editor and an experiment pipeline. OpenFeature defines a common client API, so the provider can be changed without touching call sites.
+
+**Flags and App Review.** Apple's guidelines forbid hidden, dormant or undocumented features ([App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/), 2.3.1). Rolling out a feature gradually is normal practice. Using a flag to hide a feature from review and enable it afterwards breaks the guideline.
+
+<NoDumbQuestions>
+<dt>Should the app wait for fresh flags before showing the first screen?</dt>
+<dd>For most apps, no. Waiting ties startup time to the network. Activate cached values and fetch for next time. If a value truly must be fresh, such as a minimum supported version, wait with a short timeout and fall back to the cache.</dd>
+
+<dt>How is remote config different from a feature flag?</dt>
+<dd>Technically they are the same mechanism: a key, a value and targeting rules. The difference is intent. A flag is temporary and guards new code. A config value is permanent and tunes existing code.</dd>
+
+<dt>Which ID should the percentage be based on?</dt>
+<dd>The account ID for signed-in features, so the user gets the same variant on every device. An install ID for features before sign-in. Switching between them mid-experiment moves users between groups.</dd>
+
+<dt>How do I test both sides of a flag?</dt>
+<dd>Inject the flag interface and pass a fake set to each value. Add a debug menu in internal builds that overrides flags locally, so testers can switch without touching the console.</dd>
+
+<dt>Can a flag hide a feature that is not ready for old OS versions?</dt>
+<dd>Yes. Target by OS version or device capability on the server, or combine the flag with an availability check in the wrapper.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Firebase SDK | `firebase-config` | `FirebaseRemoteConfig` | `@react-native-firebase/remote-config` | `firebase_remote_config` | Native SDK per platform, or GitLive |
+| Compiled defaults | XML resource | Dictionary or plist | Object literal | `Map` | Per platform |
+| Use cached values | `activate()` | `activate()` | `activate(config)` | `activate()` | Per platform |
+| Download new values | `fetch()` | `fetch()` | `fetchConfig(config)` | `fetch()` | Per platform |
+| Real-time change | `addOnConfigUpdateListener` | `addOnConfigUpdateListener` | `onConfigUpdated` | `onConfigUpdated` | Per platform |
+| Build-time flag | `BuildConfig` field, product flavor | Compilation condition | `process.env.EXPO_PUBLIC_*`, `__DEV__` | `--dart-define` | `BuildConfig` on Android, expect/actual constant |
+| Inject for tests | Hilt binding | Environment value | Context or module mock | Provider override | Constructor parameter |
+| Vendor-neutral API | OpenFeature Kotlin SDK | OpenFeature Swift SDK | The provider's own SDK | The provider's own SDK | OpenFeature Kotlin SDK |
+
+<Exercise>
+You are adding a redesigned search screen to an app with 2 million users. Design the flag: its kind, default, targeting, what the app does when the value changes, how the experiment is measured, and the removal plan.
+
+<Fragment slot="answer">
+- **Kind and default.** A release flag that becomes an experiment, `new_search`, default `false`. Owner: the search team. End date: eight weeks after the release that contains it.
+- **Reading.** `flags.newSearch` in the typed wrapper, read once when the search screen is opened and held for as long as that screen is on the stack.
+- **Targeting.** App version at or above the first release that contains the screen. On for the team and beta testers first, then 1% and 10% while watching crash rate and search errors, then 50% as the experiment, hashed on the account ID, or the install ID for signed-out users.
+- **Exposure.** Logged when the user opens search, by the same call in both variants, with the variant name.
+- **Metrics.** Primary: searches that lead to a product view. Guardrails: crash-free sessions, time to first result, orders per user.
+- **Duration.** Two full weeks at 50%, decided before the start. Check that exposed users split close to 50/50.
+- **Removal.** If the new screen wins, go to 100%. Delete the old screen and the flag check in the next release. Keep the console flag at 100% until versions that read it fall outside the support window, then delete it.
+- **Kill switch.** If search depends on a new backend service, add a separate permanent flag `search_enabled` that falls back to a simple "search unavailable" state. Do not reuse `new_search` for that.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** apps use the native Firebase SDKs through bindings, or a provider with a .NET client such as LaunchDarkly.
+- **Ionic / Capacitor** has a community Firebase Remote Config plugin, and any JavaScript flag SDK runs in the WebView.
+- **Lynx** receives flags from the host app, which reads them natively and passes them into the bundle.
+
+## Sources
+
+- Concepts: Pete Hodgson, [Feature Toggles (aka Feature Flags)](https://martinfowler.com/articles/feature-toggles.html), [OpenFeature Kotlin SDK](https://openfeature.dev/docs/reference/sdks/client/kotlin/), [OpenFeature Swift SDK](https://openfeature.dev/docs/reference/sdks/client/swift/)
+- Firebase: [Remote Config loading strategies](https://firebase.google.com/docs/remote-config/loading), [Get started on Android](https://firebase.google.com/docs/remote-config/android/get-started), [Get started on Apple platforms](https://firebase.google.com/docs/remote-config/get-started?platform=ios), [Get started on Flutter](https://firebase.google.com/docs/remote-config/get-started?platform=flutter), [Real-time Remote Config](https://firebase.google.com/docs/remote-config/android/real-time) (Android SDK 21.3.0+), [Remote Config rollouts](https://firebase.google.com/docs/remote-config/rollouts), [Remote Config experiments with A/B Testing](https://firebase.google.com/docs/ab-testing/abtest-config)
+- React Native: [React Native Firebase Remote Config](https://rnfirebase.io/remote-config/usage) (26.x), [Feature flag services (Expo)](https://docs.expo.dev/guides/using-feature-flags/)
+- KMP: [GitLive Firebase Kotlin SDK](https://github.com/GitLiveApp/firebase-kotlin-sdk)
+- Stores: [App Review Guidelines](https://developer.apple.com/app-store/review/guidelines/) (2.3.1), [Product page optimization](https://developer.apple.com/app-store/product-page-optimization/), [Store listing experiments](https://support.google.com/googleplay/android-developer/answer/6227309)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 30 (experimentation) and ch. 31 (feature flag hell)

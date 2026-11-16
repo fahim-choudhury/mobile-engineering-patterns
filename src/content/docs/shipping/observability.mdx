@@ -1,0 +1,319 @@
+---
+title: Crashes, hangs and observability
+description: How an app dies or freezes on a user's phone, how a report gets from that phone to a readable stack trace, and how to capture errors from every runtime in each stack.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A grocery app's dashboard says 99.8% of sessions are crash-free. The support inbox says otherwise:
+
+- "The app closes when I open my orders." The crash dashboard shows nothing for that screen.
+- The top crash has 4,000 reports and a stack trace that reads `a.b.c.a()` followed by hexadecimal addresses.
+- On older phones the cart freezes for eight seconds. Users swipe the app away. No report exists.
+- After a JavaScript error, React Native users see a white screen. The native crash reporter counts the session as healthy.
+
+The dashboard is accurate. It counts one kind of failure, and the users are meeting the others.
+
+<BrainPower>
+The app disappears while a user is looking at it. List the ways this can happen that are not an uncaught exception in your code.
+</BrainPower>
+
+## Constraints on a phone
+
+- **You cannot attach a debugger.** The failure happens on a device you will never hold, with data you do not have. Everything you learn comes from what the app recorded before it died.
+- **A dead process cannot upload.** A crash handler has a few milliseconds and must not allocate much. It writes a report to disk, and the SDK sends it on the next launch.
+- **One app has several runtimes.** JVM exceptions, native signals, JavaScript errors and Dart errors are caught by different mechanisms ([runtime anatomy](/foundations/runtime-anatomy/)). A reporter installed for one sees nothing of the others.
+- **Release builds are unreadable.** Shrinkers rename symbols, compilers strip debug information, and bundlers minify. A stack trace is addresses until it is matched with the symbol files of that exact build.
+- **The OS ends processes without raising an error.** A memory kill, a watchdog kill and a force-quit all skip your crash handler ([app lifecycle](/foundations/app-lifecycle/)).
+- **Telemetry spends the user's battery, data and privacy.** Uploads are batched and sampled, and what you may collect depends on consent and store declarations ([security and privacy](/shipping/security-privacy/)).
+
+## Ways a session ends badly
+
+```d2
+classes: {
+  seen: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  part: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  blind: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 2
+grid-columns: 4
+grid-gap: 12
+h1: "Crash SDK\nsees it" { class: head }
+h2: "Needs extra\nsetup" { class: head }
+h3: "OS reports\nit later" { class: head }
+h4: "Nobody\nreports it" { class: head }
+a: "Uncaught\nexception in the\nmain language" { class: seen }
+b: "Native signal,\nJS or Dart error,\nhandled error" { class: part }
+c: "Frozen UI kill,\nmemory kill,\nlaunch timeout" { class: blind }
+d: "Blank screen,\nwrong data,\nuser gives up" { class: blind }
+```
+
+| Ending | Android | iOS |
+| --- | --- | --- |
+| Uncaught exception | Uncaught `Throwable` ends the process | Swift runtime trap or Objective-C exception ends the process |
+| Native crash | Signal such as `SIGSEGV` in C or C++ code | The same signals |
+| Unresponsive UI | ANR: no response to input within 5 seconds ([diagnose and fix ANRs](https://developer.android.com/topic/performance/anrs/diagnose-and-fix-anrs)) | Hang: main thread busy for 250 ms or more ([WWDC22: Track down hangs](https://developer.apple.com/videos/play/wwdc2022/10082/)). A watchdog kills an app that blocks during launch ([addressing watchdog terminations](https://developer.apple.com/documentation/xcode/addressing-watchdog-terminations)) |
+| Memory | Low memory killer ends the process | Jetsam ends the process ([jetsam event reports](https://developer.apple.com/documentation/xcode/identifying-high-memory-use-with-jetsam-event-reports)) |
+| Logic failure | Error state, empty screen | Error state, empty screen |
+
+This answers the Brain Power question: a native crash, an ANR or watchdog kill, a memory kill, and the user force-quitting a frozen screen. The "orders" complaint in the opening was a memory kill while decoding large images.
+
+Google Play publishes thresholds for two of these. An app is in "bad behavior" when 1.09% or more of daily users see a crash, or 0.47% or more see an ANR, across all devices, or 8% on a single phone model. Apps above the thresholds can lose visibility in the store ([Android vitals](https://developer.android.com/topic/performance/vitals)).
+
+## The pattern
+
+1. **Install a handler for every runtime, first thing at startup.** A crash during initialization of the crash SDK's neighbours is otherwise lost.
+2. **Upload symbol files from CI for every build.** The file is stored under the build's ID, and the service uses it to turn addresses into names.
+3. **Attach context.** App version and build, OS, device model, a user or install ID, the active feature flags, and breadcrumbs: the last screens and actions.
+4. **Count sessions and users, per version.** "Crash-free sessions for 5.2.0" is the number a rollout is judged by ([releases](/shipping/releases/)).
+5. **Collect what the handler cannot see.** Ask the OS why the last process ended, measure hangs, and report handled errors as non-fatal events.
+6. **Alert on change.** A new crash signature in the latest version matters more than an old one with a large count.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  ci: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+ci: "CI, build 812" { class: ci }
+app: "App" { class: app }
+service: "Crash service" { class: srv }
+ci -> service: "symbol files for\nbuild 812" { style.font-size: 16 }
+app -> app: "1. crash: handler writes\naddresses and context\nto disk" { style.font-size: 16 }
+app -> app: "2. process dies" { style.font-size: 16 }
+app -> service: "3. next launch:\nupload the report" { style.font-size: 16 }
+service -> service: "4. symbolicate,\ngroup with\nsimilar reports" { style.font-size: 16 }
+```
+
+## Catching errors from every runtime
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+class ShopApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        // Crashlytics installed its JVM handler before this line, through a ContentProvider.
+        Firebase.crashlytics.setCustomKeys {
+            key("flag_new_checkout", flags.newCheckout)
+        }
+        reportLastExit()
+    }
+
+    private fun reportLastExit() {
+        val manager = getSystemService<ActivityManager>() ?: return
+        val last = manager.getHistoricalProcessExitReasons(packageName, 0, 1).firstOrNull() ?: return
+        when (last.reason) {
+            ApplicationExitInfo.REASON_ANR,
+            ApplicationExitInfo.REASON_LOW_MEMORY,
+            ApplicationExitInfo.REASON_CRASH_NATIVE ->
+                analytics.logEvent("abnormal_exit", bundleOf("reason" to last.reason))
+        }
+    }
+}
+```
+Crashlytics catches uncaught JVM exceptions without code, and its Gradle plugin uploads the R8 mapping file for each build ([get started with Crashlytics on Android](https://firebase.google.com/docs/crashlytics/get-started?platform=android)). Crashes in C or C++ libraries need the NDK artifact as well ([NDK crash reports](https://firebase.google.com/docs/crashlytics/ndk-reports)). `ApplicationExitInfo` (Android 11 and later) tells the next launch why the previous process ended, including ANRs and memory kills that no handler saw ([ApplicationExitInfo](https://developer.android.com/reference/android/app/ApplicationExitInfo)). An exception in a coroutine started with `launch` reaches the same uncaught handler and crashes the app. Report expected failures with `recordException` and show an error state.
+</TabItem>
+<TabItem label="iOS">
+```swift
+import MetricKit
+
+@MainActor
+final class Diagnostics {
+    private let manager = MetricManager()
+
+    func start() {
+        Task {
+            for await report in manager.diagnosticReports {
+                switch report.result {
+                case .crash(let crash):
+                    upload(kind: "crash", tree: crash.callStackTree, reason: crash.terminationReason)
+                case .hang(let hang):
+                    upload(hang)
+                default:
+                    break
+                }
+            }
+        }
+    }
+}
+```
+The OS itself records crashes, hangs and terminations and hands them to the app through MetricKit. The async `MetricManager` API shown here is new in iOS 27 and replaces `MXMetricManager`, which remains for earlier versions ([WWDC26: Meet the new MetricKit](https://developer.apple.com/videos/play/wwdc2026/222/), [MetricKit](https://developer.apple.com/documentation/metrickit)). Xcode Organizer shows the same categories for users who agreed to share diagnostics with developers, with no SDK in the app ([acquiring crash reports](https://developer.apple.com/documentation/xcode/acquiring-crash-reports-and-diagnostic-logs)). Teams add Crashlytics or Sentry for faster delivery, breadcrumbs and custom keys. A thrown Swift `Error` is a value and never a crash. Crashes come from traps: a force-unwrapped `nil`, an out-of-range index, `fatalError`. Each build's dSYM files are uploaded so that addresses become function names.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+// app/_layout.tsx
+import * as Sentry from '@sentry/react-native';
+import { Stack, type ErrorBoundaryProps } from 'expo-router';
+
+Sentry.init({
+  dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+  tracesSampleRate: 0.1,
+});
+
+// Shown in place of a route whose render threw.
+export function ErrorBoundary({ error, retry }: ErrorBoundaryProps) {
+  return <ErrorScreen message={error.message} onRetry={retry} />;
+}
+
+function RootLayout() {
+  return <Stack />;
+}
+
+export default Sentry.wrap(RootLayout);
+```
+A React Native app has three places an error can come from. An exception during render is caught by the nearest error boundary, and Expo Router lets each route file export one ([error handling in Expo Router](https://docs.expo.dev/router/error-handling/)). An uncaught error in an event handler or a rejected promise goes to a global handler, which the Sentry SDK installs. A crash in native code is caught by the Android and iOS SDKs that the same package embeds ([Sentry for Expo](https://docs.sentry.io/platforms/react-native/manual-setup/expo/)). In a release build a fatal JavaScript error closes the app. Stack traces point into the Hermes bytecode bundle and need the source map of that bundle. Every over-the-air update is a new bundle with a new source map, so the upload step belongs in the update pipeline too.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+
+  // Errors caught by the framework: build, layout, paint, gesture callbacks.
+  FlutterError.onError = FirebaseCrashlytics.instance.recordFlutterFatalError;
+
+  // Errors outside the framework: async code, timers, platform channels.
+  PlatformDispatcher.instance.onError = (error, stack) {
+    FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+    return true;
+  };
+
+  runApp(const App());
+}
+```
+Flutter needs both handlers ([handling errors in Flutter](https://docs.flutter.dev/testing/errors), [Crashlytics for Flutter](https://firebase.google.com/docs/crashlytics/flutter/customize-crash-reports)). An uncaught Dart error does not end the process. The frame or callback that threw is abandoned, a widget whose `build` failed is replaced by a grey box in release mode, and the app continues in whatever state it was left. "Fatal" in the report is therefore your label. A crash in the engine or a plugin's native code does end the process and is caught by the native SDKs inside the Crashlytics plugin. Release builds made with `--obfuscate --split-debug-info` need the generated symbol files to be uploaded ([obfuscate Dart code](https://docs.flutter.dev/deployment/obfuscate)). Errors in a background isolate are reported through that isolate's own error listener.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain
+class OrdersRepository(private val api: OrdersApi) {
+
+    // Without @Throws, an exception that reaches Swift ends the program.
+    @Throws(IOException::class, CancellationException::class)
+    suspend fun loadOrders(): List<Order> = api.orders()
+}
+```
+```swift
+// iosApp
+do {
+    orders = try await repository.loadOrders()
+} catch {
+    state = .failed            // the IOException arrives as an NSError
+}
+```
+On Android, shared Kotlin code behaves as in the Android tab. On iOS, Kotlin exceptions and Swift errors are different mechanisms. A Kotlin exception crosses into Swift as an `NSError` only if the function declares it with `@Throws`. Any other exception that reaches the boundary terminates the app ([interoperability with Swift and Objective-C](https://kotlinlang.org/docs/native-objc-interop.html#errors-and-exceptions)). The resulting crash report is written by the native handler and shows the abort call, with the Kotlin stack trace missing. CrashKiOS from Touchlab forwards the Kotlin exception and its stack trace to Crashlytics or Bugsnag ([CrashKiOS](https://github.com/touchlab/CrashKiOS)), and Sentry has a Kotlin Multiplatform SDK that wraps its Android and Apple SDKs (0.29, [Sentry for Kotlin Multiplatform](https://docs.sentry.io/platforms/kotlin/guides/kotlin-multiplatform/)). The Kotlin framework's dSYM is uploaded with the app's ([symbolicating iOS crash reports](https://kotlinlang.org/docs/native-ios-symbolication.html)).
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+A crash-free rate counts sessions that did not end in a reported crash. Memory kills, ANRs, force-quits of a frozen screen and blank screens all count as healthy. Track ANR or hang rate, abnormal exits and failed screen loads next to it, per version.
+</Aside>
+
+## From addresses to source lines
+
+| Stack | What the release build does | File that reverses it |
+| --- | --- | --- |
+| Android | R8 renames classes and methods. Native libraries are stripped | `mapping.txt`, native debug symbols |
+| iOS | Debug information is split out of the binary | dSYM per binary |
+| React Native | JavaScript is minified and compiled to Hermes bytecode | Source map per bundle, plus the two native files above |
+| Flutter | Dart is compiled ahead of time, optionally obfuscated | Symbol files from `--split-debug-info`, plus the two native files |
+| KMP / CMP | R8 on Android. A native framework on iOS | `mapping.txt`, dSYM of the Kotlin framework |
+
+Play Console and App Store Connect symbolicate their own reports when the files are in the upload ([deobfuscate crash stack traces](https://support.google.com/googleplay/android-developer/answer/9848633)). A third-party service needs its own upload step in CI. The usual failure is a hotfix built on a laptop: its symbol files never reach the service, and its crashes are the unreadable ones.
+
+## Beyond crashes
+
+- **Non-fatal errors.** A failed decode, an unexpected null from the API, a retry that gave up. Report them with the same SDK, and keep each kind rare enough that a rise is visible.
+- **Metrics.** Startup time, screen load time, request duration and failure rate, per app version and device class ([performance and app size](/shipping/performance/)).
+- **Traces.** A trace ID created in the app and sent as a header lets one slow checkout be followed from the tap through the backend services ([networking](/core-patterns/networking/)). OpenTelemetry defines the format and has SDKs for Android and Swift ([opentelemetry-android](https://github.com/open-telemetry/opentelemetry-android), [opentelemetry-swift](https://github.com/open-telemetry/opentelemetry-swift)).
+- **Logs.** Local logs are free. Remote logs cost upload and storage, so send them sampled, or only for sessions that ended in an error.
+
+## Trade-offs and scale
+
+**Store dashboards and an SDK see different things.** Android vitals and Xcode Organizer need no code, include OS-level kills, and cover only users who opted in to sharing. Their data arrives a day or more later. An SDK reports within minutes with your own context and misses what the OS hides from apps. Use both.
+
+**Sessions against users.** A crash on launch for 1% of users can be a small share of sessions and a total outage for those people. Track crash-free users as well, and look at crashes in the first seconds after launch separately.
+
+**Triage by impact and novelty.** Sort by affected users in the newest version, and by whether the signature is new. A long-lived crash in a third-party SDK with a stable rate can wait. A new crash at 0.2% during a 5% rollout is a reason to halt.
+
+**Ownership.** In a large app the crash list is long and belongs to nobody. Map modules or file paths to teams, route new issues automatically, and give the release owner the authority to halt a rollout.
+
+**Catching everything is not stability.** A blanket `try`/`catch` turns a crash into an app that continues in a broken state and reports nothing. Catch what you can handle, show an error state, and report it.
+
+**Privacy.** Breadcrumbs and logs collect whatever passes through them: emails in URLs, names in view text, tokens in headers. Scrub at the source, avoid logging request bodies, and declare the collection in the store privacy forms.
+
+**Cost.** Crash services charge by events, and session replay and tracing multiply the volume. Sample performance data, and keep error reports unsampled.
+
+<NoDumbQuestions>
+<dt>Why did a crash I can reproduce never show up in the dashboard?</dt>
+<dd>Common causes: a debugger was attached and took the signal, the app was not opened again so the report was never sent, the crash happened before the SDK started, or it was a kill by the OS, which no in-app handler sees.</dd>
+
+<dt>What is the difference between an ANR and a hang?</dt>
+<dd>Both are a blocked main thread (<a href="/foundations/concurrency/">concurrency</a>). Android shows a dialog and records an ANR after 5 seconds without a response to input. Apple's tools start reporting hangs at 250 ms and do not kill the app for them, except during launch and other watchdog-timed transitions.</dd>
+
+<dt>What crash-free rate should I aim for?</dt>
+<dd>Play's bad-behaviour threshold of 1.09% of daily users is a floor that affects store visibility. Set your own target from your current numbers and tighten it each quarter. The trend per release tells you more than the absolute value.</dd>
+
+<dt>Should handled errors be sent as non-fatals?</dt>
+<dd>The unexpected ones, yes. An offline request failing is expected and belongs in metrics. A response that fails to decode is a bug on one side and deserves a report with the payload shape.</dd>
+
+<dt>Do I need the same crash service on every platform?</dt>
+<dd>It helps when one team owns several apps, because versions, users and releases line up in one place. The native-only parts, such as MetricKit and Android vitals, stay separate either way.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Uncaught error handler | `Thread.setDefaultUncaughtExceptionHandler` | Signal and exception handlers | Global JS handler, plus native | `FlutterError.onError`, `PlatformDispatcher.onError`, plus native | Android's on Android, an unhandled exception hook on iOS |
+| UI error boundary | None. A composable that throws crashes | None. A view that traps crashes | Error boundary component | `ErrorWidget.builder` | None |
+| Frozen UI | ANR | Hang, watchdog termination | Both, plus a blocked JS thread | Both, plus a blocked UI isolate | Both |
+| Reason for last exit | `ApplicationExitInfo` | MetricKit diagnostics | Native APIs through a module | Native APIs through a plugin | Per platform |
+| Store dashboard | Android vitals | Xcode Organizer | Both | Both | Both |
+| Symbol file | `mapping.txt` | dSYM | Source map | `--split-debug-info` output | `mapping.txt`, dSYM |
+| Handled error | `recordException` | `record(error:)` | `Sentry.captureException` | `recordError` | SDK call in common code |
+| Custom context | `setCustomKey` | `setCustomValue` | `Sentry.setTag`, `setContext` | `setCustomKey` | SDK call in common code |
+
+<Exercise>
+Match each symptom to the signal that would have revealed it, and name what was missing.
+
+1. Users on 3 GB phones report the app "restarting" when they return from the camera.
+2. A crash has 2,000 reports with a stack of `0x0000000104a3c1f8` lines.
+3. Scrolling the feed stutters on mid-range Android phones, and the crash dashboard is clean.
+4. After Tuesday's over-the-air update, the settings screen is blank for React Native users on the 5.0 binary.
+5. iOS users of a KMP app crash with a report that ends in `abort()` and no Kotlin frames.
+
+<Fragment slot="answer">
+1. A memory kill while the app was in the background. The signal is the last exit reason: `ApplicationExitInfo` with `REASON_LOW_MEMORY`, or MetricKit's exit data on iOS. The fix is state restoration ([app lifecycle](/foundations/app-lifecycle/)) and lower memory use. The crash SDK alone could never see it.
+2. The dSYM for that build was not uploaded. Add the upload to CI and find the archive for that build number to symbolicate the existing reports.
+3. Slow frames and possibly ANRs. The signals are frame metrics and ANR rate in Android vitals, or a performance SDK's slow-frame counts ([performance](/shipping/performance/)).
+4. A JavaScript error during render, caught by an error boundary or leaving an empty tree. The signals are error boundary reports and JS errors grouped by update ID and native version. The update called something the 5.0 binary lacks, so the runtime version was wrong.
+5. A Kotlin exception crossed into Swift without `@Throws`. Add the annotation where Swift should handle the error, and install CrashKiOS or the Sentry KMP SDK so the Kotlin stack trace is attached.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** apps report managed exceptions through `AppDomain.UnhandledException` and use Sentry or a similar SDK that also embeds the native reporters.
+- **Ionic / Capacitor** needs a JavaScript error handler in the WebView and native crash reporting for the shell, as React Native does.
+- **Lynx** errors in the script thread are delivered to the host app, which reports them with its native SDK.
+
+## Sources
+
+- Android: [Android vitals](https://developer.android.com/topic/performance/vitals), [Crashes in Android vitals](https://developer.android.com/google/play/vitals/crash), [Diagnose and fix ANRs](https://developer.android.com/topic/performance/anrs/diagnose-and-fix-anrs), [ApplicationExitInfo](https://developer.android.com/reference/android/app/ApplicationExitInfo) (API 30+), [Deobfuscate or symbolicate crash stack traces](https://support.google.com/googleplay/android-developer/answer/9848633)
+- iOS: [MetricKit](https://developer.apple.com/documentation/metrickit), [WWDC26: Meet the new MetricKit](https://developer.apple.com/videos/play/wwdc2026/222/) (iOS 27), [WWDC22: Track down hangs with Xcode and on-device detection](https://developer.apple.com/videos/play/wwdc2022/10082/), [Acquiring crash reports and diagnostic logs](https://developer.apple.com/documentation/xcode/acquiring-crash-reports-and-diagnostic-logs), [Addressing watchdog terminations](https://developer.apple.com/documentation/xcode/addressing-watchdog-terminations), [Identifying high-memory use with jetsam event reports](https://developer.apple.com/documentation/xcode/identifying-high-memory-use-with-jetsam-event-reports)
+- Firebase: [Get started with Crashlytics](https://firebase.google.com/docs/crashlytics/get-started?platform=android), [NDK crash reports](https://firebase.google.com/docs/crashlytics/ndk-reports), [Customize crash reports for Flutter](https://firebase.google.com/docs/crashlytics/flutter/customize-crash-reports)
+- React Native: [Sentry for Expo](https://docs.sentry.io/platforms/react-native/manual-setup/expo/), [Error handling in Expo Router](https://docs.expo.dev/router/error-handling/)
+- Flutter: [Handling errors in Flutter](https://docs.flutter.dev/testing/errors), [Obfuscate Dart code](https://docs.flutter.dev/deployment/obfuscate)
+- KMP: [Interoperability with Swift and Objective-C: errors and exceptions](https://kotlinlang.org/docs/native-objc-interop.html#errors-and-exceptions), [Symbolicating iOS crash reports](https://kotlinlang.org/docs/native-ios-symbolication.html), [CrashKiOS](https://github.com/touchlab/CrashKiOS), [Sentry for Kotlin Multiplatform](https://docs.sentry.io/platforms/kotlin/guides/kotlin-multiplatform/) (0.29)
+- Tracing: [opentelemetry-android](https://github.com/open-telemetry/opentelemetry-android), [opentelemetry-swift](https://github.com/open-telemetry/opentelemetry-swift)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 6 (app crashes), ch. 33 (analytics, monitoring and alerting) and ch. 34 (mobile on-call)

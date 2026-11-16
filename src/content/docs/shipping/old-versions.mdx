@@ -1,0 +1,309 @@
+---
+title: Old app versions and forced upgrades
+description: How to keep a backend working for app versions released years ago, decide when to stop supporting them, and build the upgrade prompt and the blocking screen in each stack.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A backend engineer renames the JSON field `price` to `amount` and updates the web client in the same pull request. The reports that follow:
+
+- App versions 3.1 to 4.4 show every product as free, and version 2.8 crashes while decoding the response.
+- The team decides to force everyone onto 4.5. Versions before 3.6 have no upgrade screen, so those users keep seeing free products.
+- Version 4.5 raised the minimum OS version. Users on older phones see "Update required", tap the button, and the store has nothing newer to give them.
+- An endpoint deleted last year still receives 40,000 requests a day from version 2.3.
+
+On the web, the old client disappears when the new one is deployed. On mobile, every version you have ever released keeps running until its last user updates or leaves.
+
+<BrainPower>
+What share of your users runs a version of your app that is more than six months old? Where would you look that number up, and who on the backend team knows it?
+</BrainPower>
+
+## Constraints on a phone
+
+- **Users update when they want.** Automatic updates are a setting that can be off, and they wait for Wi-Fi, charge and free storage. A release reaches most users in days and the last ones in years ([releases you can't roll back](/shipping/releases/)).
+- **The OS version caps the app version.** A device below your minimum OS version cannot install your new release, so its user stays on the last version that supported it. In Android Studio's distribution data for October 2026, Android 16 was the largest single version at about 25% of devices, and a little over half of devices ran Android 14 or later ([distribution dashboard](https://developer.android.com/about/dashboards), figures reported by [heise](https://www.heise.de/en/news/Android-version-distribution-in-October-2026-Android-16-leads-11504842.html)). On iOS, 79% of all iPhones ran iOS 26 on June 7, 2026 ([App Store usage](https://developer.apple.com/support/app-store/)). iPhones move faster, and both platforms have a tail.
+- **Every released version is an API client.** The backend serves the newest app and the three-year-old one from the same endpoints.
+- **The stores set deadlines in the other direction.** Since August 31, 2026, new apps and updates on Google Play must target Android 16 (API 36) ([target API level requirements](https://support.google.com/googleplay/android-developer/answer/11926878)). From April 2027, uploads to App Store Connect must be built with the iOS 27 SDK ([submitting to the App Store](https://developer.apple.com/app-store/submitting/)). Libraries have deadlines too: Play accepts only Billing Library 8 or later since the same August date ([Billing Library deprecation](https://developer.android.com/google/play/billing/deprecation-faq)). You cannot leave an app untouched for two years and then ship a small fix.
+
+## The pattern
+
+1. **Send the version with every request.** A header such as `X-App-Version: 4.4.0` plus platform and OS version. The backend logs it, so the version distribution is a query away.
+2. **Change the API by adding.** New fields are added and old ones keep working. A field is removed only after the versions that read it are gone. Clients ignore fields and enum values they do not know ([tolerant decoding](/core-patterns/networking/#tolerant-decoding-and-old-versions)).
+3. **Publish a support window.** For example: versions released in the last 12 months are supported. The backend team can then answer "can I delete this?" from a dashboard.
+4. **Serve two thresholds from the backend.** A recommended version, below which the app suggests an update, and a minimum version, below which the app blocks. Both are checked at launch and can be changed without a release.
+5. **Ship the blocking screen in version 1.0.** A version that does not contain the screen cannot be told to show it.
+6. **Give old clients an error they understand.** A retired endpoint returns a stable status, such as 426 Upgrade Required ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-426-upgrade-required)), which every version maps to the blocking screen.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  store: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App 3.9.0" { class: app }
+backend: "Backend" { class: srv }
+store: "App store" { class: store }
+app -> backend: "GET /config\nX-App-Version: 3.9.0" { style.font-size: 16 }
+backend -> app: "minimum 4.0.0\nrecommended 4.4.0" { style.font-size: 16 }
+app -> app: "3.9.0 < 4.0.0:\nshow blocking screen" { style.font-size: 16 }
+app -> store: "user taps Update" { style.font-size: 16 }
+store -> app: "4.5.0 installed" { style.font-size: 16 }
+```
+
+The thresholds divide the installed versions into bands:
+
+```d2
+classes: {
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  nudge: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  block: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 2
+grid-columns: 3
+grid-gap: 12
+h1: "Below minimum" { class: head }
+h2: "Below recommended" { class: head }
+h3: "Current" { class: head }
+b: "3.x and older:\nblocking screen,\nAPI may refuse" { class: block }
+n: "4.0 to 4.3:\ndismissible prompt,\nAPI fully supported" { class: nudge }
+o: "4.4 and 4.5:\nno prompt" { class: ok }
+```
+
+## The upgrade gate in each stack
+
+Each sample compares the installed version with the minimum from the backend and sends the user to an update.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+class UpgradeGate(private val activity: ComponentActivity) {
+    private val manager = AppUpdateManagerFactory.create(activity)
+
+    private val launcher = activity.registerForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK) activity.finish()   // required update refused
+    }
+
+    suspend fun enforce() {
+        val info = manager.requestAppUpdateInfo()
+        if (info.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
+            info.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)
+        ) {
+            manager.startUpdateFlowForResult(
+                info,
+                launcher,
+                AppUpdateOptions.newBuilder(AppUpdateType.IMMEDIATE).build(),
+            )
+        }
+    }
+}
+```
+Call `enforce()` when the backend says the installed version is below the minimum. Play's in-app updates library (`app-update-ktx` 2.1.0) downloads and installs the update without the user leaving the app. An immediate update shows a full-screen flow and restarts the app. A flexible update downloads in the background while the user keeps working ([in-app updates](https://developer.android.com/guide/playcore/in-app-updates), [Kotlin guide](https://developer.android.com/guide/playcore/in-app-updates/kotlin-java)). It works only for installs from Google Play, so keep a plain blocking screen with a store link as the fallback. Play Console's recovery tools can also prompt users of chosen versions to update, with no code in the app ([prompt users to update](https://support.google.com/googleplay/android-developer/answer/13812041)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+struct UpgradeGate<Content: View>: View {
+    let minimumVersion: String?          // from the backend, nil until loaded
+    @ViewBuilder var content: Content
+    @Environment(\.openURL) private var openURL
+
+    private var installed: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+
+    var body: some View {
+        if let minimumVersion,
+           installed.compare(minimumVersion, options: .numeric) == .orderedAscending {
+            ContentUnavailableView {
+                Label("Update required", systemImage: "arrow.down.circle")
+            } description: {
+                Text("This version is no longer supported.")
+            } actions: {
+                Button("Open the App Store") {
+                    openURL(URL(string: "https://apps.apple.com/app/id1234567890")!)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+```
+iOS has no API that installs an update from inside the app or forces one. The app compares versions itself and links to its App Store page. The `.numeric` option compares "4.10" and "4.9" as numbers. Apple's public iTunes Lookup endpoint returns the version currently in the store for a bundle ID ([iTunes Search API](https://performance-partners.apple.com/search-api)), which is enough for a "new version available" hint. A required minimum belongs on your own backend, because only you know which versions are broken.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import * as Application from 'expo-application';
+import { Linking, Platform } from 'react-native';
+
+const STORE_URL = Platform.select({
+  ios: 'https://apps.apple.com/app/id1234567890',
+  android: 'market://details?id=com.example.shop',
+})!;
+
+export function UpgradeGate({ minimum, children }: Props) {
+  const installed = Application.nativeApplicationVersion ?? '0';
+  if (minimum && compareVersions(installed, minimum) < 0) {
+    return (
+      <BlockingScreen
+        title="Update required"
+        onPress={() => Linking.openURL(STORE_URL)}
+      />
+    );
+  }
+  return children;
+}
+```
+`nativeApplicationVersion` is the version of the native binary ([expo-application](https://docs.expo.dev/versions/latest/sdk/application/)). A React Native app has a second version to track: the over-the-air update it is running. A bug in JavaScript can be fixed for old binaries with an update instead of a forced upgrade ([Expo Update](/shipping/releases/#a-staged-rollout-in-each-stack)), so the gate is needed only when the fix requires new native code. Send both the native version and the update ID to the backend.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+class UpgradeGate extends StatelessWidget {
+  const UpgradeGate({super.key, required this.minimum, required this.installed, required this.child});
+
+  final Version? minimum;      // from the backend
+  final Version installed;     // Version.parse((await PackageInfo.fromPlatform()).version)
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final minimum = this.minimum;
+    if (minimum == null || installed >= minimum) return child;
+    return BlockingScreen(
+      title: 'Update required',
+      onPressed: () async {
+        if (Platform.isAndroid) {
+          await InAppUpdate.performImmediateUpdate();
+        } else {
+          await launchUrl(Uri.parse('https://apps.apple.com/app/id1234567890'));
+        }
+      },
+    );
+  }
+}
+```
+`package_info_plus` reads the installed version ([package_info_plus](https://pub.dev/packages/package_info_plus)), and `Version` from the Dart team's `pub_semver` package compares versions as numbers ([pub_semver](https://pub.dev/packages/pub_semver)). On Android, the `in_app_update` plugin (5.0) wraps Play's in-app updates ([in_app_update](https://pub.dev/packages/in_app_update)). On iOS the button opens the store page with `url_launcher`. The `upgrader` package bundles the store lookup and a dialog if you prefer not to build your own ([upgrader](https://pub.dev/packages/upgrader)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: the decision is shared, the screen is per platform or in Compose.
+data class VersionPolicy(val minimum: AppVersion, val recommended: AppVersion)
+
+sealed interface UpgradeDecision {
+    data object UpToDate : UpgradeDecision
+    data object Recommended : UpgradeDecision
+    data object Required : UpgradeDecision
+}
+
+fun decide(installed: AppVersion, policy: VersionPolicy): UpgradeDecision = when {
+    installed < policy.minimum -> UpgradeDecision.Required
+    installed < policy.recommended -> UpgradeDecision.Recommended
+    else -> UpgradeDecision.UpToDate
+}
+
+data class AppVersion(val major: Int, val minor: Int, val patch: Int) : Comparable<AppVersion> {
+    override fun compareTo(other: AppVersion) =
+        compareValuesBy(this, other, { it.major }, { it.minor }, { it.patch })
+}
+```
+The comparison and the policy are plain Kotlin, which is the kind of code a shared module is for: one implementation, one set of tests, the same answer on both platforms. Reading the installed version and starting the update are platform calls behind an interface: Play in-app updates in `androidMain`, a store URL in `iosMain`.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Compare versions as numbers. As strings, "4.10.0" sorts before "4.9.0", and the gate blocks your newest release. Also check the user's OS before showing "Update required": if the device is below the new version's minimum OS, the store has no update to offer. Tell those users that their device is no longer supported, or keep their last version working.
+</Aside>
+
+## Deciding when to drop a version
+
+| Signal | Source |
+| --- | --- |
+| Active users per app version | Your analytics, or the version header in backend logs |
+| Installs per app version and OS version | Play Console statistics, App Store Connect analytics |
+| Requests per endpoint per app version | Backend logs |
+| Revenue per app version | Analytics joined with orders |
+
+A version is cheap to keep when it uses the same endpoints as newer ones. It becomes expensive when it needs its own code path on the backend, depends on a third-party service that is shutting down, or has a security flaw. Those are the reasons to raise the minimum. A small share of users can still be many people: 1% of a million users is 10,000 customers who see a wall the next morning.
+
+## Trade-offs and scale
+
+**Prompting against blocking.** A dismissible prompt costs little and moves most users within a few weeks. A blocking screen moves everyone who can update and loses some of those who cannot or will not. Keep blocking for security fixes, legal requirements and data corruption.
+
+**The minimum OS decision.** Raising the minimum OS version removes old-OS workarounds from the codebase and freezes some users on their current app version. Those users are then the long tail of this chapter. Decide with the OS share of your own users, which often differs from the global numbers.
+
+**Data migrations skip versions.** A user can update from 2.3 straight to 5.0. Local database migrations must run in sequence from any old schema ([migrations](/core-patterns/persistence/#migrations)), and the tests should include the oldest version you still let upgrade.
+
+**API evolution strategies.** Additive changes on one endpoint are the cheapest. Versioned endpoints (`/v2/orders`) isolate a breaking change and leave two implementations to maintain. GraphQL makes field usage visible per client, so a field can be removed when its usage reaches zero. In every case the backend needs contract tests that replay requests from old app versions.
+
+**Feature flags and old versions.** A flag keeps being evaluated by old versions for as long as they run. Target flags by minimum app version, and do not reuse a flag name for a new purpose ([feature flags](/shipping/feature-flags/)).
+
+**The yearly store work.** Budget time each year for the new target API level, the new Xcode and SDK, and library deadlines. Play also requires apps targeting Android 15 or later to support 16 KB memory pages, which affects every native library in the app ([16 KB page sizes](https://developer.android.com/guide/practices/page-sizes)).
+
+**Over-the-air updates shorten the tail for one layer.** React Native teams and Flutter teams using Shorebird can bring the JavaScript or Dart of an old binary up to date. The native part of that binary still ages, and the runtime version keeps incompatible updates away from it.
+
+<NoDumbQuestions>
+<dt>Can I remove old versions from the store?</dt>
+<dd>The store only offers the newest version a device can run. Old versions exist as installed copies on devices, and nothing you do in the store console touches them.</dd>
+
+<dt>What should the backend return to a version it no longer supports?</dt>
+<dd>A response the oldest app can handle. If old versions map 426 to the blocking screen, send 426. If they predate the screen, the least bad options are an error they show as a generic failure, or a server-driven message field that those versions already display.</dd>
+
+<dt>Is a flexible or an immediate update the right default on Android?</dt>
+<dd>Flexible for a recommended version, since the user keeps working while it downloads. Immediate when the version is below the minimum.</dd>
+
+<dt>How long should the support window be?</dt>
+<dd>Long enough that the blocked group is small when you close it. Look at your own adoption curve: the time it takes a release to reach 95% of active users is a reasonable starting value.</dd>
+
+<dt>Can the app check the store for a newer version by itself?</dt>
+<dd>On Android, the in-app updates API answers that for Play installs. On iOS, the iTunes Lookup endpoint returns the store version. Neither knows which versions you consider broken, so the minimum still comes from your backend.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Version shown to users | `versionName` | `CFBundleShortVersionString` | `version` in app config | `version` in `pubspec.yaml` | Both native fields |
+| Read it at runtime | `PackageInfo.versionName` | `Bundle.main.infoDictionary` | `Application.nativeApplicationVersion` | `PackageInfo.fromPlatform()` | Platform call behind an interface |
+| Minimum OS | `minSdk` | Deployment target | Set in app config and build properties | `minSdk` in Gradle, deployment target in Xcode | Both |
+| Update inside the app | Play in-app updates | None | Native module for Play, none on iOS | `in_app_update` on Android | Play in-app updates in `androidMain` |
+| Send user to the store | `market://details?id=` | `apps.apple.com/app/id` URL | `Linking.openURL` | `url_launcher` | Platform call |
+| Console-driven prompt | Play recovery tools | None | Same as Android | Same as Android | Same as Android |
+| Second version to track | n/a | n/a | Update ID and runtime version | Patch number with Shorebird | n/a |
+| Yearly deadline | Target API level | Xcode and SDK version | Both, through the Expo SDK version | Both, through the Flutter version | Both |
+
+<Exercise>
+Your app has these active users by version: 5.2 (current) 58%, 5.1 22%, 5.0 9%, 4.x 8%, 3.x 2.5%, 2.x 0.5%. The blocking screen was added in 3.0. The backend team wants to delete the `/v1/cart` endpoint, which only versions 3.x and older call. Version 5.0 raised the minimum to Android 10 and iOS 17. Write a plan.
+
+<Fragment slot="answer">
+1. Check who is on 3.x and 2.x. Split the 3% by OS version. Users below Android 10 or iOS 17 cannot install 5.x, so a blocking screen leaves them with no path. Suppose half of them are in that group.
+2. Set the recommended version to 5.1 now. Versions 3.0 and later show the dismissible prompt, and some of the 3.x users move by themselves over a few weeks.
+3. Decide about the stuck devices. The options are to keep `/v1/cart` alive for them, or to end support and show a message that says the device is no longer supported. The second option needs a message those versions can already display.
+4. Announce a date, then set the minimum version to 4.0. Versions 3.x show the blocking screen. On Android, also use Play recovery tools to prompt 3.x users.
+5. Version 2.x has no blocking screen. Change `/v1/cart` to return an error that 2.x shows as a failure, with a server-provided message if that version supports one. This group is 0.5% and has had no update in years.
+6. Watch requests to `/v1/cart` by version. Delete the endpoint when traffic is near zero, and keep returning 426 from its path so a stray old client still gets a defined answer.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** reads the version through `AppInfo.Current.VersionString` and uses platform code for Play in-app updates.
+- **Ionic / Capacitor** apps read the native version with the App plugin. Their web layer can be updated over the air like React Native's JavaScript.
+- **Lynx** bundles are fetched by the host app, so the host decides which bundle version an old binary receives.
+
+## Sources
+
+- Android: [Distribution dashboard](https://developer.android.com/about/dashboards), [Android version distribution, October 2026 (heise)](https://www.heise.de/en/news/Android-version-distribution-in-October-2026-Android-16-leads-11504842.html), [In-app updates](https://developer.android.com/guide/playcore/in-app-updates) (app-update 2.1.0), [In-app updates: Kotlin guide](https://developer.android.com/guide/playcore/in-app-updates/kotlin-java), [Prompt users to update with recovery tools](https://support.google.com/googleplay/android-developer/answer/13812041), [Target API level requirements](https://support.google.com/googleplay/android-developer/answer/11926878), [Billing Library deprecation](https://developer.android.com/google/play/billing/deprecation-faq), [Support 16 KB page sizes](https://developer.android.com/guide/practices/page-sizes), [uses-sdk element](https://developer.android.com/guide/topics/manifest/uses-sdk-element)
+- iOS: [App Store usage by OS version](https://developer.apple.com/support/app-store/) (June 7, 2026), [Submitting to the App Store](https://developer.apple.com/app-store/submitting/) (SDK requirement from April 2027), [iTunes Search API](https://performance-partners.apple.com/search-api)
+- React Native: [expo-application](https://docs.expo.dev/versions/latest/sdk/application/), [Runtime versions](https://docs.expo.dev/eas-update/runtime-versions/)
+- Flutter: [package_info_plus](https://pub.dev/packages/package_info_plus), [pub_semver](https://pub.dev/packages/pub_semver), [in_app_update](https://pub.dev/packages/in_app_update) (5.0), [upgrader](https://pub.dev/packages/upgrader)
+- HTTP: [RFC 9110, 426 Upgrade Required](https://www.rfc-editor.org/rfc/rfc9110.html#name-426-upgrade-required)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 3 (the long tail of old app versions) and ch. 38 (forced upgrading)

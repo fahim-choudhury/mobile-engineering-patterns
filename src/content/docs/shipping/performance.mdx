@@ -1,0 +1,269 @@
+---
+title: Performance and app size
+description: How to measure startup time, frame rate, memory and download size on real devices, set budgets for them, and use each stack's profiling and benchmarking tools.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A marketplace app feels fast to the team that builds it. The reviews describe a different app:
+
+- Startup takes six seconds on a three-year-old budget Android phone and one second on the team's phones.
+- The feed stutters while scrolling, and worst when new images come in.
+- The download is 180 MB. Installs are lowest in the countries where mobile data is most expensive.
+- A release in March doubled startup time. Nobody noticed until May.
+
+None of these is a bug in the usual sense. Every feature works. The app is slow and large for the people whose devices and networks differ from the team's.
+
+<BrainPower>
+A phone with a 120 Hz screen draws a new frame 120 times per second. How many milliseconds does your app have to produce one frame, and what work has to fit into that time?
+</BrainPower>
+
+## Constraints on a phone
+
+- **A frame has a deadline.** At 60 Hz the app has 16.7 ms per frame, and at 120 Hz it has 8.3 ms. State changes, layout and drawing for that frame all have to fit ([phases of a frame](/foundations/declarative-ui/#phases-of-a-frame)). A missed deadline repeats the previous frame, which the user sees as a stutter.
+- **A cold start does everything.** The OS creates the process, loads the code, starts the runtime or engine, runs your initialization and draws the first frame ([runtime anatomy](/foundations/runtime-anatomy/)). Android vitals marks a cold start of 5 seconds or more as excessive, 2 seconds for a warm start and 1.5 seconds for a hot start ([app startup time in Android vitals](https://developer.android.com/google/play/vitals/launch-time)).
+- **Devices differ by an order of magnitude.** The slowest phone your users own may have a quarter of the CPU speed and memory of the one on your desk, and it slows further when hot.
+- **Memory is rationed.** An app that uses too much is killed in the background first and in the foreground eventually ([app lifecycle](/foundations/app-lifecycle/)).
+- **Size has thresholds.** Google Play warns users on mobile data before downloading an app over 200 MB ([Play size limits](https://support.google.com/googleplay/android-developer/answer/9859372)). App Store Connect flags builds whose download exceeds 200 MB as over the cellular download limit ([view builds and metadata](https://developer.apple.com/help/app-store-connect/manage-builds/view-builds-and-metadata/)).
+- **Debug builds lie.** They skip compiler optimizations and add checks. Android debug builds interpret much of the code, and React Native and Flutter debug builds run in a different execution mode from release.
+
+## The pattern
+
+1. **Choose metrics a user would notice.** Time from tap to first frame, and to usable content. Share of slow and frozen frames while scrolling. Hang rate. Memory at peak. Download and installed size.
+2. **Measure release builds on a slow, real device.** Keep one cheap Android phone and one old iPhone for this.
+3. **Use lab and field data together.** A benchmark on one device finds regressions before release. Field data from users shows the real distribution. Read the 90th and 99th percentile, since the median describes the users who have no problem.
+4. **Set budgets and check them in CI.** "Cold start under 2 seconds on the reference phone" and "download under 60 MB" become checks that fail a pull request.
+5. **Fix in order of effect.** Do less work, do it later, do it off the main thread, and only then make the remaining work faster.
+
+```d2
+classes: {
+  os: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  rt: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  done: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+start: "Cold start, in reading order" {
+  style.font-size: 18
+  grid-rows: 2
+  grid-columns: 3
+  grid-gap: 10
+  a: "OS: create\nprocess,\nload code" { class: os }
+  b: "Runtime:\nART, Hermes,\nFlutter engine" { class: rt }
+  c: "Your init:\nDI graph,\nSDKs, flags" { class: app }
+  d: "First screen:\nbuild UI,\nread cache" { class: app }
+  e: "First frame\n(initial\ndisplay)" { class: done }
+  f: "Content\nloaded (full\ndisplay)" { class: done }
+}
+```
+
+You control the two blue boxes directly and the yellow one through your choice of stack and its configuration. Most slow starts are in the third box: every SDK that initializes itself at launch adds to it.
+
+## Measuring startup and frames in each stack
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+    @get:Rule
+    val rule = MacrobenchmarkRule()
+
+    @Test
+    fun coldStart() = rule.measureRepeated(
+        packageName = "com.example.market",
+        metrics = listOf(StartupTimingMetric(), FrameTimingMetric()),
+        compilationMode = CompilationMode.Partial(BaselineProfileMode.Require),
+        startupMode = StartupMode.COLD,
+        iterations = 10,
+    ) {
+        pressHome()
+        startActivityAndWait()
+    }
+}
+```
+Macrobenchmark drives the release build from a separate test module and reports startup and frame timings ([write a Macrobenchmark](https://developer.android.com/topic/performance/benchmarking/macrobenchmark-overview)). A Baseline Profile lists the classes and methods used during startup and key journeys, and ART compiles them ahead of time at install. Google's documentation gives about 30% faster code execution from the first launch ([Baseline Profiles](https://developer.android.com/topic/performance/baselineprofiles/overview)). R8 shrinks and optimizes the code ([enable app optimization](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization)). Call `reportFullyDrawn()` when real content is on screen so that time to full display is recorded ([app startup time](https://developer.android.com/topic/performance/vitals/launch-time)). For Compose, measure in release mode and check which composables recompose ([Compose performance](https://developer.android.com/develop/ui/compose/performance)). Field data comes from Android vitals.
+</TabItem>
+<TabItem label="iOS">
+```swift
+final class LaunchTests: XCTestCase {
+    func testColdLaunch() {
+        measure(metrics: [XCTApplicationLaunchMetric()]) {
+            XCUIApplication().launch()
+        }
+    }
+
+    func testFeedScroll() {
+        let app = XCUIApplication()
+        app.launch()
+        let feed = app.collectionViews.firstMatch
+        measure(metrics: [XCTOSSignpostMetric.scrollingAndDecelerationMetric]) {
+            feed.swipeUp(velocity: .fast)
+        }
+    }
+}
+```
+XCTest performance tests launch the app repeatedly and compare the result with a stored baseline ([XCTApplicationLaunchMetric](https://developer.apple.com/documentation/xctest/xctapplicationlaunchmetric)). Instruments has templates for app launch, time profiling, hangs and SwiftUI updates. Apple's launch guidance is to reduce the work before the first frame: fewer dynamic libraries, no heavy work in initializers or `application(_:didFinishLaunchingWithOptions:)` ([reducing your app's launch time](https://developer.apple.com/documentation/xcode/reducing-your-app-s-launch-time)). Apple calls a late frame a hitch and a blocked main thread a hang ([improving app responsiveness](https://developer.apple.com/documentation/xcode/improving-app-responsiveness)). Field data for launch time, hangs, hitches, memory and disk writes is in Xcode Organizer and MetricKit ([analyzing the performance of your shipping app](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-shipping-app)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+// Mark the moments you care about. They appear in the DevTools Performance panel.
+performance.mark('feed:request');
+const items = await fetchFeed();
+performance.mark('feed:data');
+performance.measure('feed load', 'feed:request', 'feed:data');
+
+// Long lists: recycle rows instead of mounting one component per item.
+<FlashList
+  data={items}
+  renderItem={({ item }) => <FeedRow item={item} />}
+  keyExtractor={(item) => item.id}
+/>
+```
+A React Native app has two threads that can each miss a frame: the JavaScript thread, which runs React, and the UI thread, which draws native views ([performance overview](https://reactnative.dev/docs/performance)). Hermes runs bytecode compiled at build time, so startup does not parse JavaScript source ([Hermes](https://reactnative.dev/docs/hermes)). The Performance panel in React Native DevTools (0.83 and later) records a trace with JavaScript execution, React renders and your own marks ([React Native DevTools](https://reactnative.dev/docs/react-native-devtools)). The common fixes are a recycling list such as FlashList ([FlashList](https://shopify.github.io/flash-list/)), animations that run on the UI thread with Reanimated, images through `expo-image` with disk caching, and moving heavy computation out of render. Expo Atlas shows which modules make up the bundle ([analyzing bundles](https://docs.expo.dev/guides/analyzing-bundles/)). Native startup and frame tools from the first two tabs still apply to the native side.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+void main() {
+  final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('feed scroll', (tester) async {
+    await tester.pumpWidget(const MarketApp());
+    await tester.pumpAndSettle();
+
+    await binding.traceAction(() async {
+      await tester.fling(find.byType(ListView), const Offset(0, -3000), 5000);
+      await tester.pumpAndSettle();
+    }, reportKey: 'feed_scroll');
+  });
+}
+```
+Run it with `flutter drive --profile` on a real device to get a timeline with build and raster times per frame ([measure performance with an integration test](https://docs.flutter.dev/cookbook/testing/integration/profiling)). Profile mode compiles ahead of time like release and keeps the tracing hooks, so it is the mode to measure in ([Flutter performance profiling](https://docs.flutter.dev/perf/ui-performance)). Flutter has a UI thread that builds and lays out widgets and a raster thread that draws, and DevTools shows the time each spent per frame. The Impeller renderer, the default on iOS and on Android API 29 and later, compiles its shaders at build time, which removed the first-run stutter of the older renderer ([Impeller](https://docs.flutter.dev/perf/impeller)). The common fixes are `const` widgets, `ListView.builder`, smaller rebuild scopes and decoding JSON in an isolate ([performance best practices](https://docs.flutter.dev/perf/best-practices)). `flutter build appbundle --analyze-size` writes a size breakdown for DevTools ([measuring your app's size](https://docs.flutter.dev/perf/app-size)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// androidApp benchmark module: the Android tab's Macrobenchmark runs unchanged.
+// iosApp UI test target: the iOS tab's XCTest launch metric runs unchanged.
+
+// commonMain: keep startup work out of object initializers.
+class AppGraph(platform: PlatformDependencies) {
+    val database by lazy { createDatabase(platform.driverFactory) }   // first use, not launch
+    val api by lazy { createHttpClient(platform.engine) }
+}
+```
+A KMP app is measured with each platform's tools, because the shared code is compiled into the Android app and into a native framework for iOS. On Android, Baseline Profiles and R8 cover the shared module like any other library. On iOS, shared code is compiled by Kotlin/Native and has its own garbage collector running next to Swift's reference counting ([Kotlin/Native memory management](https://kotlinlang.org/docs/native-memory-manager.html)). It shows up in Instruments' time profiler with Kotlin function names when the framework's debug symbols are present. Compose Multiplatform on iOS draws with its own Skia-based renderer, which adds that renderer to the app's size and startup. Measure the first Compose screen on an old iPhone before committing to it for the launch screen.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Performance numbers from a debug build, an emulator or a simulator are not comparable to anything. A simulator runs on a laptop CPU, and a debug build can be several times slower than release. Measure a release or profile build on a physical device, and repeat the measurement, because single runs vary.
+</Aside>
+
+## App size
+
+```d2
+classes: {
+  code: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  rt: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  res: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 1
+grid-gap: 12
+a: "Your code:\ncompiled Kotlin,\nSwift, JS, Dart" { class: code }
+b: "Libraries\nand SDKs" { class: code }
+c: "Runtime you ship:\nHermes, Flutter engine,\nSkia, Kotlin/Native" { class: rt }
+d: "Images, fonts,\nanimations,\ntranslations" { class: res }
+```
+
+| Stack | Ships beyond your own code | Size tool |
+| --- | --- | --- |
+| Android | Jetpack libraries | APK Analyzer, Play Console app size report |
+| iOS | Swift packages. System frameworks are on the device | App Thinning Size Report, App Store Connect file sizes |
+| React Native | Hermes, React Native's native libraries, the bytecode bundle | Expo Atlas for the bundle, plus both native tools |
+| Flutter | The Flutter engine and the compiled Dart snapshot | `--analyze-size`, DevTools app size tool |
+| KMP / CMP | Kotlin/Native runtime on iOS. With CMP, Compose and Skia on iOS | Both native tools |
+
+Both stores deliver a build fitted to the device. Play generates APKs from an Android App Bundle with only that device's CPU architecture, screen density and languages ([Android App Bundles](https://developer.android.com/guide/app-bundle)). The App Store thins an upload per device model ([reducing your app's size](https://developer.apple.com/documentation/xcode/reducing-your-app-s-size)). The number to track is the download size the store reports per device, and the size of the file you upload overstates it.
+
+The usual savings, largest first: remove unused SDKs, compress or convert images to WebP or AVIF, download rarely used assets on demand, enable code shrinking, and drop fonts and translations you do not use.
+
+## Trade-offs and scale
+
+**Perceived speed.** Showing cached content at once and refreshing it afterwards feels faster than a spinner followed by fresh content, even when the total time is the same ([persistence](/core-patterns/persistence/)). Skeleton screens and optimistic updates work the same way. Measure both the first frame and the moment content is usable.
+
+**Startup creep.** Each team adds one initializer for its SDK, and each costs 50 ms. Review what runs before the first frame, make initialization lazy by default, and require a reason for anything eager.
+
+**Lab noise.** Benchmarks on shared CI emulators vary too much to catch a 10% regression. Use a physical device or a device farm, compare medians over many runs, and alert on a trend across commits. A size check has no noise and can block a pull request from the first day.
+
+**Device classes.** Split field data into low, mid and high-end devices by RAM or chipset. An average over all devices hides a severe problem on the low end behind good numbers on the high end.
+
+**Memory.** Images are the largest consumer. Decode them at display size, cap the in-memory cache, and release it on the memory warning. Find leaks with LeakCanary on Android ([LeakCanary](https://square.github.io/leakcanary/)) and the memory graph debugger in Xcode.
+
+**Battery and data.** Background work, location and frequent polling drain the battery ([background work](/core-patterns/background-work/)). Batch network requests, and let the OS scheduler pick the time.
+
+**Optimizing without measuring.** Memoizing every component or moving everything to a background thread adds complexity and often changes nothing. Profile, fix the largest item in the trace, and measure again.
+
+<NoDumbQuestions>
+<dt>Is a cross-platform app slower than a native one?</dt>
+<dd>It starts with an extra step, loading its runtime or engine, and carries that in its size. During normal use the difference depends on the screen. A list of text and images performs well in every stack here. Measure the screens you plan to build on a slow device before deciding.</dd>
+
+<dt>Does a Baseline Profile matter if Play already optimizes apps?</dt>
+<dd>Play's cloud profiles are built from real usage after a version has been in use for a while. A Baseline Profile ships inside the app and applies from the first launch of every new version, which is when cloud profiles do not exist yet.</dd>
+
+<dt>What is the difference between time to initial display and time to full display?</dt>
+<dd>Initial display is the first frame, which may be an empty layout. Full display is when the content the user came for is visible. The system can measure the first automatically. You report the second.</dd>
+
+<dt>How small should the app be?</dt>
+<dd>There is no universal number. Compare against the apps your users already have, track installs against size in your slowest markets, and set a budget that stops growth: each release may not exceed the previous one by more than an agreed amount without review.</dd>
+
+<dt>Should animations run at 120 Hz?</dt>
+<dd>The OS decides the refresh rate and may lower it to save power. Your job is to finish each frame within the deadline it gives. Work that fits in 16 ms and not in 8 ms shows up only on high-refresh devices.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Late frame | Slow frame, frozen frame, jank | Hitch | Dropped frame on the JS or UI thread | Jank on the UI or raster thread | Per platform |
+| Blocked main thread | ANR | Hang | Blocked JS thread, plus native | Blocked UI isolate, plus native | Per platform |
+| Startup benchmark | Macrobenchmark `StartupTimingMetric` | `XCTApplicationLaunchMetric` | Native tools | Native tools, `flutter run --trace-startup` | Native tools |
+| Scroll benchmark | Macrobenchmark `FrameTimingMetric` | `XCTOSSignpostMetric` | DevTools Performance panel | `traceAction` in `integration_test` | Native tools |
+| Profiler | Android Studio profiler, Perfetto | Instruments | React Native DevTools | Flutter DevTools | Android Studio and Instruments |
+| Ahead-of-time help | Baseline Profiles | Compiled ahead of time already | Hermes bytecode | AOT snapshot | Baseline Profiles on Android |
+| Code shrinking | R8 | Dead code stripping | Minifier, tree shaking in Metro | Tree shaking in the Dart compiler | R8 on Android |
+| Field data | Android vitals | Xcode Organizer, MetricKit | Both, plus an SDK for JS metrics | Both | Both |
+| Custom trace section | `trace("name") { }` | `OSSignposter` | `performance.mark` | `Timeline.startSync` | Per platform |
+| Memory leak finder | LeakCanary, heap dump | Memory graph debugger | Hermes heap snapshot | DevTools memory view | Per platform |
+
+<Exercise>
+The marketplace app from the opening cold-starts in six seconds on the reference Android phone. A trace of the launch shows: 0.6 s process and runtime start, 2.1 s initializing eight SDKs in `Application.onCreate`, 0.9 s building the dependency graph and opening the database on the main thread, 1.8 s waiting for the home feed request before showing anything, 0.6 s rendering the first screen. Order the fixes and estimate what each one saves.
+
+<Fragment slot="answer">
+1. **Show cached content before the network answers** (saves up to 1.8 s of perceived start). Render the home feed from the local database and refresh it in the background. The first frame no longer waits for the request.
+2. **Make SDK initialization lazy** (saves most of 2.1 s). Crash reporting stays eager. Analytics, maps, payments, chat and the rest start on first use or after the first frame.
+3. **Move the database open and heavy graph construction off the main thread, and make them lazy** (saves most of 0.9 s on the path to first frame). The first screen needs only the objects it uses.
+4. **Add a Baseline Profile and confirm R8 is on** (reduces the remaining 0.6 s render and part of the 0.6 s runtime start). Both phases run code that would otherwise be interpreted on first launch.
+5. **Add a Macrobenchmark for cold start to CI** with a budget, so the March regression would have failed a build.
+
+The order follows the rule in the pattern: stop waiting, defer work, move work, then speed up what is left. After the first three steps the first frame arrives in about 1.5 s on the same phone, before any code has been made faster.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** compiles ahead of time on iOS and offers startup tracing and full AOT options on Android, with the .NET runtime included in the app's size.
+- **Ionic / Capacitor** startup includes creating a WebView and loading the web bundle, and web performance tools such as Lighthouse and the browser profiler apply.
+- **Lynx** runs layout and scripting on separate threads and renders native views, with startup shaped by bundle loading.
+
+## Sources
+
+- Android: [App startup time in Android vitals](https://developer.android.com/google/play/vitals/launch-time), [App startup time](https://developer.android.com/topic/performance/vitals/launch-time), [Write a Macrobenchmark](https://developer.android.com/topic/performance/benchmarking/macrobenchmark-overview), [Baseline Profiles overview](https://developer.android.com/topic/performance/baselineprofiles/overview), [Enable app optimization with R8](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization), [Compose performance](https://developer.android.com/develop/ui/compose/performance), [Android App Bundles](https://developer.android.com/guide/app-bundle), [APK Analyzer](https://developer.android.com/studio/debug/apk-analyzer), [Google Play size limits](https://support.google.com/googleplay/android-developer/answer/9859372), [LeakCanary](https://square.github.io/leakcanary/)
+- iOS: [Reducing your app's launch time](https://developer.apple.com/documentation/xcode/reducing-your-app-s-launch-time), [Improving app responsiveness](https://developer.apple.com/documentation/xcode/improving-app-responsiveness), [Analyzing the performance of your shipping app](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-shipping-app), [XCTApplicationLaunchMetric](https://developer.apple.com/documentation/xctest/xctapplicationlaunchmetric), [Reducing your app's size](https://developer.apple.com/documentation/xcode/reducing-your-app-s-size), [View builds and metadata](https://developer.apple.com/help/app-store-connect/manage-builds/view-builds-and-metadata/), [Maximum build file sizes](https://developer.apple.com/help/app-store-connect/reference/app-uploads/maximum-build-file-sizes/)
+- React Native: [Performance overview](https://reactnative.dev/docs/performance), [Hermes](https://reactnative.dev/docs/hermes), [React Native DevTools](https://reactnative.dev/docs/react-native-devtools) (Performance panel since 0.83), [FlashList](https://shopify.github.io/flash-list/), [Analyzing bundles with Expo Atlas](https://docs.expo.dev/guides/analyzing-bundles/)
+- Flutter: [Flutter performance profiling](https://docs.flutter.dev/perf/ui-performance), [Measure performance with an integration test](https://docs.flutter.dev/cookbook/testing/integration/profiling), [Performance best practices](https://docs.flutter.dev/perf/best-practices), [Impeller rendering engine](https://docs.flutter.dev/perf/impeller), [Measuring your app's size](https://docs.flutter.dev/perf/app-size)
+- KMP: [Kotlin/Native memory management](https://kotlinlang.org/docs/native-memory-manager.html)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 32 (performance) and ch. 39 (app size)

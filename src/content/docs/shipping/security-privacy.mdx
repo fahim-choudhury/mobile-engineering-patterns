@@ -1,0 +1,311 @@
+---
+title: Security and privacy
+description: What an attacker can do with your app binary, a user's device and the network in between, and how each stack stores tokens, protects connections, proves the app is genuine and declares the data it collects.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A security review of a ticketing app returns five findings:
+
+- The secret key for the payment provider is in the app, found by unzipping the download and searching for `sk_live`.
+- The refresh token is stored in a plain preferences file and is included in device backups.
+- A modified copy of the app with the purchase limit removed is talking to the production API. The backend cannot tell it from the real one.
+- The crash reports contain customers' email addresses, taken from a URL in the breadcrumbs.
+- The store submission was rejected: an analytics SDK reads the advertising ID, and the privacy declaration says the app collects nothing.
+
+None of these needed a skilled attacker. Each came from treating the phone as a place the developer controls.
+
+<BrainPower>
+You ship an API key inside the app. The code is obfuscated and the key is XOR-ed with a constant. Who can read the key, with what tools, and how long does it take them?
+</BrainPower>
+
+## Constraints on a phone
+
+- **The binary is public.** Anyone can download the app, unpack it and read its code and resources. Kotlin and Java bytecode decompile to readable source. Swift and Dart machine code can be disassembled. A JavaScript bundle, bytecode or not, can be dumped. Obfuscation renames things and slows the reader down.
+- **The device belongs to the user.** On a rooted or jailbroken phone, the user can read the app's files, attach a debugger, change memory and replace functions at runtime. They can also install their own certificate authority and watch the app's HTTPS traffic through a proxy.
+- **The device gets lost.** A phone left in a taxi holds whatever the app stored.
+- **Other apps are neighbours.** Any app can send your app a deep link or an intent ([navigation](/core-patterns/navigation/#links-from-outside-the-app)). The clipboard, screenshots and the app switcher preview are shared surfaces.
+- **The stores and the law ask for declarations.** Both stores require you to state what data the app and its SDKs collect, and privacy laws require consent for some of it.
+
+This answers the Brain Power question. Everyone with the app can read the key. The fast way skips the obfuscation entirely: run the app behind a proxy and read the key from the request it sends. It takes minutes.
+
+## The pattern
+
+```d2
+classes: {
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  mid: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  good: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: right
+device: "User's device: not trusted" {
+  style.font-size: 18
+  grid-rows: 2
+  grid-gap: 10
+  binary: "App binary\nand memory:\nreadable,\nchangeable" { class: bad }
+  storage: "Keychain or\nKeystore:\nhardware-backed,\nper app" { class: mid }
+}
+net: "Network:\nTLS, visible\nto the device\nowner" { class: mid }
+backend: "Your backend: trusted" {
+  style.font-size: 18
+  grid-rows: 2
+  grid-gap: 10
+  rules: "Decisions:\nprices, limits,\nentitlements" { class: good }
+  secrets: "Secrets:\nprovider keys,\nsigning keys" { class: good }
+}
+device -> net -> backend
+```
+
+1. **Keep secrets on the server.** A key that grants power, such as a payment provider's secret key, lives on the backend, and the app calls your backend. Keys that must ship in the app, such as a maps key or a Firebase configuration, are identifiers. Restrict them in the provider's console to your app ID and to the APIs they need.
+2. **Let the server decide.** Prices, limits, permissions and entitlements are checked on the backend for every request. The client's checks exist to give quick feedback.
+3. **Store credentials in the platform's secure storage.** Tokens go into the Keychain or behind a Keystore key. Access tokens are short-lived and refresh tokens can be revoked ([token refresh](/core-patterns/networking/#token-refresh-once)).
+4. **Use the platform's TLS defaults.** Both platforms block plain HTTP by default. Add certificate pinning only with a rotation plan.
+5. **Treat everything arriving from outside as untrusted input.** Deep links, intents, push payloads, pasted text and web content are validated before use.
+6. **Ask the platform whether the app is genuine.** An attestation token from Play Integrity or App Attest lets the backend tell your signed app on a real device from a modified copy or a script.
+7. **Collect less, and declare what you collect.** Request permissions at the moment they are needed. Keep personal data out of logs, analytics and crash reports. Keep the store privacy forms in step with the SDKs you ship.
+
+## Storing a token in each stack
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+private const val KEY_ALIAS = "session_key"
+
+private fun sessionKey(): SecretKey {
+    val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+
+    val spec = KeyGenParameterSpec.Builder(
+        KEY_ALIAS,
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+    )
+        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+        .build()
+    return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        .apply { init(spec) }
+        .generateKey()
+}
+
+class EncryptedToken(val iv: ByteArray, val ciphertext: ByteArray)
+
+fun encrypt(token: String): EncryptedToken {
+    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+    cipher.init(Cipher.ENCRYPT_MODE, sessionKey())
+    return EncryptedToken(cipher.iv, cipher.doFinal(token.encodeToByteArray()))
+}
+```
+The key is generated inside the Android Keystore and never leaves it. The app asks the Keystore to encrypt and decrypt, and on devices with secure hardware the key material is not readable even by the OS ([Android Keystore system](https://developer.android.com/privacy-and-security/keystore)). The app stores the `iv` and `ciphertext` in DataStore. Jetpack Security's `EncryptedSharedPreferences` used to wrap these steps. The library deprecated all its APIs in 1.1.0-alpha07 in favour of using the Keystore directly ([Security releases](https://developer.android.com/jetpack/androidx/releases/security)). Keystore keys are not included in backups, so exclude the encrypted file from Auto Backup or handle a failed decryption after a restore by signing the user out ([Auto Backup](https://developer.android.com/identity/data/autobackup)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+struct KeychainError: Error { let status: OSStatus }
+
+func saveRefreshToken(_ token: String) throws {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "example.tickets.session",
+        kSecAttrAccount as String: "refresh-token",
+    ]
+    SecItemDelete(query as CFDictionary)
+
+    var item = query
+    item[kSecValueData as String] = Data(token.utf8)
+    item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    let status = SecItemAdd(item as CFDictionary, nil)
+    guard status == errSecSuccess else { throw KeychainError(status: status) }
+}
+```
+The Keychain is an encrypted database managed by the system, and each item is readable only by the app, or app group, that stored it ([Keychain services](https://developer.apple.com/documentation/security/keychain-services)). The accessibility attribute sets when the item can be read. `AfterFirstUnlock` lets background tasks read the token after the user has unlocked the phone once since boot, and `ThisDeviceOnly` keeps it out of backups and device transfers. An item can also require Face ID or Touch ID for each read by attaching an access control object. `UserDefaults` is a plain file and is the wrong place for a token.
+</TabItem>
+<TabItem label="React Native">
+```ts
+import * as SecureStore from 'expo-secure-store';
+
+const KEY = 'refreshToken';
+
+export async function saveRefreshToken(token: string) {
+  await SecureStore.setItemAsync(KEY, token, {
+    keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+  });
+}
+
+export const readRefreshToken = () => SecureStore.getItemAsync(KEY);
+export const clearRefreshToken = () => SecureStore.deleteItemAsync(KEY);
+```
+`expo-secure-store` writes to the Keychain on iOS and to preferences encrypted with a Keystore key on Android ([SecureStore](https://docs.expo.dev/versions/latest/sdk/securestore/)). AsyncStorage and an unencrypted MMKV instance are plain files. Environment variables with the `EXPO_PUBLIC_` prefix are copied into the JavaScript bundle at build time, so they are as public as the rest of the app ([environment variables in Expo](https://docs.expo.dev/guides/environment-variables/)). The same applies to anything imported from a config file. `@expo/app-integrity` exposes Play Integrity and App Attest to JavaScript ([AppIntegrity](https://docs.expo.dev/versions/latest/sdk/app-integrity/)).
+</TabItem>
+<TabItem label="Flutter">
+```dart
+const _storage = FlutterSecureStorage(
+  iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock_this_device),
+);
+
+Future<void> saveRefreshToken(String token) =>
+    _storage.write(key: 'refreshToken', value: token);
+
+Future<String?> readRefreshToken() => _storage.read(key: 'refreshToken');
+
+Future<void> clearRefreshToken() => _storage.delete(key: 'refreshToken');
+```
+`flutter_secure_storage` (11.0) uses the Keychain on iOS and a Keystore-protected cipher on Android. Version 11 removed its old `EncryptedSharedPreferences` backend, so upgrade through version 10 first to migrate stored values ([flutter_secure_storage](https://pub.dev/packages/flutter_secure_storage), [changelog](https://pub.dev/packages/flutter_secure_storage/changelog)). `shared_preferences` is a plain file. Values passed with `--dart-define` are compiled into the binary and can be extracted. Firebase App Check wraps Play Integrity and App Attest behind one Flutter API and can protect your own backend as well as Firebase services ([Firebase App Check](https://firebase.google.com/docs/app-check)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain
+interface SecureStore {
+    suspend fun save(key: String, value: String)
+    suspend fun read(key: String): String?
+    suspend fun delete(key: String)
+}
+
+class SessionRepository(private val store: SecureStore, private val api: AuthApi) {
+    suspend fun signOut() {
+        runCatching { api.revoke(store.read("refreshToken")) }   // server forgets the token
+        store.delete("refreshToken")                              // device forgets it too
+    }
+}
+```
+Kotlin Multiplatform has no common secure storage API. The shared module declares the interface and the session logic. `androidMain` implements it with the Keystore code from the Android tab, and `iosMain` with the Keychain through Kotlin/Native's Security framework bindings, or in Swift and passed in. The community library Multiplatform Settings has a Keychain-backed implementation for Apple targets ([multiplatform-settings](https://github.com/russhwolf/multiplatform-settings)). Shared code makes one rule easier to keep: the sign-out sequence, token refresh and request signing are written once and behave the same on both platforms.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Secure storage protects a token from other apps and from someone holding a locked phone. It does not protect it from the device's owner on a rooted or jailbroken device, or from your own app sending it somewhere. Keep tokens short-lived, bind them to a device where the backend supports it, and never write them to logs.
+</Aside>
+
+## The network
+
+| | Android | iOS |
+| --- | --- | --- |
+| Plain HTTP | Blocked by default since Android 9 ([network security configuration](https://developer.android.com/privacy-and-security/security-config)) | Blocked by App Transport Security ([NSAppTransportSecurity](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity)) |
+| User-installed certificate authorities | Not trusted by apps by default since Android 7 | Trusted once the user enables full trust for the certificate |
+| Declarative pinning | `<pin-set>` in the network security configuration | `NSPinnedDomains` in `Info.plist` ([identity pinning](https://developer.apple.com/news/?id=g9ejcf8y)) |
+
+Pinning makes the app accept only certificates whose public key matches a hash shipped in the app. It stops interception by a trusted-but-wrong certificate authority and makes casual traffic inspection harder. Its cost is operational: when the server's key changes and the app has no matching pin, every installed copy stops connecting until its user updates. Android's guide carries a caution against pinning for this reason, and its configuration format has a backup pin and an expiration date after which pinning is switched off ([security with network protocols](https://developer.android.com/privacy-and-security/security-ssl)). If you pin, pin to at least two keys, keep the spare key offline, and remember how long old versions live ([old app versions](/shipping/old-versions/)).
+
+## Proving the app is genuine
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  os: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App" { class: app }
+platform: "Play Integrity\nor App Attest" { class: os }
+backend: "Your backend" { class: srv }
+app -> platform: "1. request a token bound\nto a hash of this request" { style.font-size: 16 }
+platform -> app: "2. signed token" { style.font-size: 16 }
+app -> backend: "3. request + token" { style.font-size: 16 }
+backend -> platform: "4. verify the token" { style.font-size: 16 }
+platform -> backend: "5. verdict: genuine app,\ngenuine device, or not" { style.font-size: 16 }
+backend -> app: "6. allow, limit or refuse" { style.font-size: 16 }
+```
+
+On Android, the Play Integrity API returns a verdict about the app binary, the device and the Play account, and its standard request is designed to be called often, with a latency of a few hundred milliseconds ([Play Integrity overview](https://developer.android.com/google/play/integrity/overview)). On iOS, App Attest creates a key in the Secure Enclave that Apple certifies as belonging to an unmodified copy of your app, and the app signs requests with it ([establishing your app's integrity](https://developer.apple.com/documentation/devicecheck/establishing-your-app-s-integrity)). The verdict is checked on the backend, because a check inside the app can be removed by the same person who modified the app. Treat it as one input: some genuine users have unusual devices, so use the verdict to add friction or limits before blocking outright.
+
+## Privacy obligations
+
+| Obligation | Android | iOS |
+| --- | --- | --- |
+| Permission at time of use | Runtime permissions | Permission prompts with a purpose string in `Info.plist` |
+| Picking a photo without permission | Photo picker ([photo picker](https://developer.android.com/training/data-storage/shared/photo-picker)) | `PhotosPicker` |
+| Consent to track across apps | Advertising ID permission, user can delete the ID | App Tracking Transparency prompt ([App Tracking Transparency](https://developer.apple.com/documentation/apptrackingtransparency)) |
+| Store declaration | Data safety form ([Data safety](https://support.google.com/googleplay/android-developer/answer/10787469)) | App privacy details ([App privacy details](https://developer.apple.com/app-store/app-privacy-details/)) |
+| SDK transparency | Google Play SDK Index ([SDK Index](https://play.google.com/sdks)) | Privacy manifests and required-reason APIs ([privacy manifest files](https://developer.apple.com/documentation/bundleresources/privacy-manifest-files)) |
+| Account deletion | Required if the app creates accounts ([Play account deletion](https://support.google.com/googleplay/android-developer/answer/13327111)) | Required if the app creates accounts ([guideline 5.1.1(v)](https://developer.apple.com/help/app-review/guideline-reference/5-1-1-account-deletion/)) |
+| Age signals | Play Age Signals API, in beta ([Age Signals](https://developer.android.com/google/play/age-signals/use-age-signals-api)) | Declared Age Range API ([Declared Age Range](https://developer.apple.com/documentation/declaredagerange)) |
+
+You are responsible for what third-party SDKs in your app collect. The rejected submission in the opening is the usual case: an SDK was added, and nobody updated the declaration. Review the forms whenever a dependency is added or upgraded. Age assurance rules are new in several jurisdictions in 2026 and are changing, so check Apple's and Google's current guidance before building on them ([Apple age assurance Q&A](https://developer.apple.com/support/age-assurance/)).
+
+## Trade-offs and scale
+
+**Hardening against cost.** Obfuscation, root detection, debugger detection and runtime integrity checks raise the effort needed to tamper with the app. They also cause false positives, break on OS updates and need maintenance. A banking or game app has reason to pay that. A recipe app usually does not. The OWASP Mobile Application Security Verification Standard lists the controls by category and is a good checklist for deciding ([OWASP MASVS](https://mas.owasp.org/MASVS/)).
+
+**Biometrics are a local gate.** Face or fingerprint unlock proves to the device that its owner is present. Tie it to a key: a Keystore key or Keychain item that can only be used after biometric authentication ([biometric authentication on Android](https://developer.android.com/identity/sign-in/biometric-auth), [LocalAuthentication](https://developer.apple.com/documentation/localauthentication)). An `if (authenticated)` branch around a token that is readable anyway adds nothing against an attacker with the device.
+
+**Passkeys remove the password.** A passkey is a key pair created per site and synced by the platform's password manager. Sign-in is a signature that the server verifies, so there is no shared secret to phish or leak. Android uses Credential Manager and iOS uses AuthenticationServices ([passkeys on Android](https://developer.android.com/identity/passkeys), [supporting passkeys](https://developer.apple.com/documentation/authenticationservices/supporting-passkeys)). Both need the same domain association files as app links ([navigation](/core-patterns/navigation/#links-from-outside-the-app)).
+
+**WebViews widen the surface.** A WebView that loads remote content and exposes a JavaScript bridge gives that content access to native functions. Load only your own origins, keep the bridge small, and open other sites in the system browser tab.
+
+**Dependencies run as you.** Every SDK has your app's permissions, network access and storage. Pin versions with lockfiles, review what a new SDK does, remove the ones nobody uses, and watch the SDK Index and security advisories.
+
+**Shared surfaces.** Mark screens with card numbers or one-time codes as secure so they are left out of screenshots and the app switcher: `FLAG_SECURE` on Android, and covering the content when the scene becomes inactive on iOS. Clear the clipboard after copying a secret, or mark it sensitive.
+
+**Logs and analytics.** Production logs, breadcrumbs and analytics events should carry IDs and never names, emails, tokens or full URLs with query strings ([observability](/shipping/observability/)). Scrub them in one place, such as the logging wrapper, since a rule in a style guide gets forgotten.
+
+<NoDumbQuestions>
+<dt>Is obfuscation pointless then?</dt>
+<dd>It is useful and limited. R8 or a commercial obfuscator makes reverse engineering slower and shrinks the app. It never turns a secret in the binary into a secret.</dd>
+
+<dt>Where does the Google Maps or Firebase key go?</dt>
+<dd>In the app, because the SDK needs it on the device. Restrict it in the provider's console to your package name and signing certificate or bundle ID, and to the specific APIs. For Firebase, add App Check so only your app can use the backend resources.</dd>
+
+<dt>Should the app refuse to run on rooted or jailbroken devices?</dt>
+<dd>Local detection can be bypassed by the people it is aimed at and blocks some legitimate users. Prefer a server-side decision based on an attestation verdict, and limit only the sensitive actions.</dd>
+
+<dt>Is HTTPS enough without pinning?</dt>
+<dd>For most apps, yes. The platform validates the certificate chain against its trusted authorities, and Android ignores user-installed authorities by default. Pinning addresses a narrower threat and adds an outage risk.</dd>
+
+<dt>What should happen on sign-out?</dt>
+<dd>Revoke the refresh token on the server, delete tokens from secure storage, clear the local database and caches that hold user data, and detach the push token from the account (<a href="/core-patterns/background-work/#token-lifecycle">token lifecycle</a>).</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Secure storage | Android Keystore + DataStore | Keychain | `expo-secure-store` | `flutter_secure_storage` | Interface, per-platform implementation |
+| Plain storage to avoid for secrets | `SharedPreferences`, DataStore alone | `UserDefaults` | AsyncStorage | `shared_preferences` | Multiplatform Settings without Keychain |
+| Block plain HTTP | Network security configuration | App Transport Security | Both, set through app config | Both, in the native projects | Both |
+| Certificate pinning | `<pin-set>` | `NSPinnedDomains` | Native configuration through a config plugin | Native configuration, or the HTTP client's hook | Ktor engine configuration per platform |
+| App attestation | Play Integrity | App Attest | `@expo/app-integrity` | Firebase App Check | Per platform |
+| Biometric prompt | `BiometricPrompt` | `LAContext` | `expo-local-authentication` | `local_auth` | Per platform |
+| Passkeys | Credential Manager | AuthenticationServices | Native module | Native plugin | Per platform |
+| Hide from screenshots | `FLAG_SECURE` | Cover on `scenePhase` change | `expo-screen-capture` | Native flag through a plugin | Per platform |
+| Privacy declaration | Data safety form | App privacy details, privacy manifest | Both | Both | Both |
+| Build-time values are public | `BuildConfig`, resources | `Info.plist`, compiled constants | `EXPO_PUBLIC_*`, bundled config | `--dart-define` | Both |
+
+<Exercise>
+A food delivery app works like this. Find the problems and say what you would change.
+
+1. The app holds the payment provider's secret key in `BuildConfig` and charges cards directly from the device.
+2. The cart total is computed in the app and sent to the backend as `amount`.
+3. After sign-in, the access token (valid for one year) is saved in `SharedPreferences` or `UserDefaults`.
+4. The deep link `fooddash://promo?code=X&credit=20` adds 20 of credit to the account.
+5. Every request is logged with full headers to the remote logging service "for debugging".
+6. The app pins the server's current leaf certificate, which is renewed every 90 days.
+
+<Fragment slot="answer">
+1. The secret key is public. Move charging to the backend: the app sends the cart and a payment method token from the provider's client SDK, and the backend creates the charge with the secret key. Rotate the leaked key.
+2. The backend must compute the total from item IDs and its own prices. The `amount` from the client is a hint for display at most.
+3. Use a short-lived access token kept in memory, and a refresh token in the Keychain or behind a Keystore key. Make refresh tokens revocable on the server.
+4. A link is input from anyone. The link may carry a promo code. The backend validates the code and decides the credit. The app never accepts an amount from a URL.
+5. Headers contain the bearer token and possibly cookies. Log a request ID, the path without query values, status and timing. Strip authorization headers in the logging layer.
+6. In 90 days every installed version stops connecting. Pin to the public key of an intermediate or to two keys with one held in reserve, set an expiration on the pin, or drop pinning and rely on the platform's validation.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** has a `SecureStorage` API backed by the Keychain and the Android Keystore.
+- **Ionic / Capacitor** apps keep all web code and assets readable inside the package. Secrets in JavaScript are public, and tokens belong in a secure storage plugin, not `localStorage`.
+- **Lynx** uses the host app's native storage and networking, so the native rules in this chapter apply to the host.
+
+## Sources
+
+- Standards: [OWASP MASVS](https://mas.owasp.org/MASVS/)
+- Android: [Android Keystore system](https://developer.android.com/privacy-and-security/keystore), [Jetpack Security releases](https://developer.android.com/jetpack/androidx/releases/security) (deprecated in 1.1.0-alpha07), [Auto Backup](https://developer.android.com/identity/data/autobackup), [Network security configuration](https://developer.android.com/privacy-and-security/security-config), [Security with network protocols](https://developer.android.com/privacy-and-security/security-ssl), [Play Integrity API overview](https://developer.android.com/google/play/integrity/overview), [Biometric authentication](https://developer.android.com/identity/sign-in/biometric-auth), [Passkeys](https://developer.android.com/identity/passkeys), [Photo picker](https://developer.android.com/training/data-storage/shared/photo-picker), [Data safety section](https://support.google.com/googleplay/android-developer/answer/10787469), [Google Play SDK Index](https://play.google.com/sdks), [Play account deletion requirements](https://support.google.com/googleplay/android-developer/answer/13327111), [Play Age Signals API](https://developer.android.com/google/play/age-signals/use-age-signals-api) (beta)
+- iOS: [Keychain services](https://developer.apple.com/documentation/security/keychain-services), [NSAppTransportSecurity](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity), [Identity pinning](https://developer.apple.com/news/?id=g9ejcf8y), [Establishing your app's integrity](https://developer.apple.com/documentation/devicecheck/establishing-your-app-s-integrity), [LocalAuthentication](https://developer.apple.com/documentation/localauthentication), [Supporting passkeys](https://developer.apple.com/documentation/authenticationservices/supporting-passkeys), [App Tracking Transparency](https://developer.apple.com/documentation/apptrackingtransparency), [Privacy manifest files](https://developer.apple.com/documentation/bundleresources/privacy-manifest-files), [App privacy details](https://developer.apple.com/app-store/app-privacy-details/), [Guideline 5.1.1(v): account deletion](https://developer.apple.com/help/app-review/guideline-reference/5-1-1-account-deletion/), [Declared Age Range](https://developer.apple.com/documentation/declaredagerange), [Age assurance developer Q&A](https://developer.apple.com/support/age-assurance/)
+- React Native: [SecureStore](https://docs.expo.dev/versions/latest/sdk/securestore/), [Environment variables in Expo](https://docs.expo.dev/guides/environment-variables/), [AppIntegrity](https://docs.expo.dev/versions/latest/sdk/app-integrity/)
+- Flutter: [flutter_secure_storage](https://pub.dev/packages/flutter_secure_storage) (11.0), [Firebase App Check](https://firebase.google.com/docs/app-check)
+- KMP: [multiplatform-settings](https://github.com/russhwolf/multiplatform-settings)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 36 (compliance, privacy and security) and ch. 10 (third-party libraries and SDKs)
