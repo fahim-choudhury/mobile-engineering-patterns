@@ -1,0 +1,386 @@
+---
+title: Persistence and offline-first
+description: How each stack stores data on the device, with Room, SwiftData, expo-sqlite, drift and SQLDelight, and how an app keeps working without a connection by treating the local database as the source of truth.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A notes app stores everything on a server and fetches it on launch. The bug reports:
+
+- A user writes a note in the underground. The save fails, they close the app, and the note is gone.
+- Version 2.3 adds a "pinned" column. Users who update from 2.1 crash on launch, and reinstalling loses their data.
+- A security review finds the session token in a plain preferences file.
+- A user edits the same note on a phone and a tablet. One edit disappears without a trace.
+
+The first bug is an app that needs the network to accept a write. The second is a schema change without a migration. The third is the wrong store for the data. The fourth is a missing conflict rule.
+
+<BrainPower>
+A user is offline and taps "delete" on a note. The app removes the row from its local database immediately. When the connection returns, how does the app know it still owes the server a delete?
+</BrainPower>
+
+## Constraints on a phone
+
+- **Storage is private and small.** Each app has a sandboxed directory. The OS can clear the cache directory when space runs low, and the user can clear everything.
+- **The process can die during a write.** A half-written file is corrupt. Databases solve this with transactions, and plain files need atomic replace ([app lifecycle](/foundations/app-lifecycle/)).
+- **The schema lives on the user's device.** Every version of your database format that ever shipped still exists on some phone. An update has to migrate each of them forward, in one step or many.
+- **Backups copy the data elsewhere.** Android Auto Backup and iCloud backup restore app files onto a new device, including files you assumed were tied to the old one ([Auto Backup](https://developer.android.com/identity/data/autobackup)).
+- **Connectivity is not guaranteed.** Reads and writes that need the server will fail on a regular basis ([networking](/core-patterns/networking/)).
+
+## Pick the store by the shape of the data
+
+```d2
+classes: {
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  box: { style: { font-size: 16 } }
+  a: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  b: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  c: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  d: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 3
+grid-columns: 4
+grid-gap: 12
+h1: "Settings" { class: head }
+h2: "Secrets" { class: head }
+h3: "Structured data" { class: head }
+h4: "Blobs" { class: head }
+e1: "Theme, last tab,\nonboarding seen" { class: a }
+e2: "Tokens, keys,\npasswords" { class: b }
+e3: "Notes, orders,\nmessages" { class: c }
+e4: "Photos, PDFs,\ndownloads" { class: d }
+s1: "Key-value store" { class: box }
+s2: "Keystore-backed\nor Keychain storage" { class: box }
+s3: "SQLite database" { class: box }
+s4: "Files, with the path\nin the database" { class: box }
+```
+
+A key-value store is read whole and has no queries, so it fits a handful of small values. Anything you list, filter, sort or join belongs in a database, and on mobile that means SQLite: it ships with both operating systems, and almost every library below is a layer over it. Secrets go in storage protected by the hardware-backed keystore, which the [security chapter](/shipping/security-privacy/) covers.
+
+## The pattern: the database is the source of truth
+
+In an offline-first app the UI never waits for the network. It reads from the local database and writes to the local database. A separate sync process moves changes between the database and the server.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ui: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  db: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  sync: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+ui: "UI\nobserves a query" { class: ui }
+repo: "Repository" { class: box }
+db: "Local database\nnotes + outbox" { class: db; shape: cylinder }
+sync: "Sync\nruns when online" { class: sync }
+server: "Server" { class: box }
+ui -> repo: "write" { style.font-size: 16 }
+repo -> db: "1. save + queue" { style.font-size: 16 }
+db -> ui: "2. query emits" { style.font-size: 16 }
+db -> sync: "3. pending\nchanges" { style.font-size: 16 }
+sync -> server: "4. push" { style.font-size: 16 }
+server -> sync: "5. pull" { style.font-size: 16 }
+sync -> db: "6. apply" { style.font-size: 16 }
+```
+
+1. **Reads are observable queries.** The UI subscribes to "all notes, newest first". When any code changes the table, the query emits a new list and the screen redraws ([state management](/core-patterns/state-management/)).
+2. **Writes go to the database first.** The note is saved locally and appears on screen within a frame.
+3. **Pending changes are recorded in an outbox.** In the same transaction as the write, the app adds a row describing what the server still needs to hear: "create note 17", "delete note 9". This answers the Brain Power question. The outbox row survives app restarts, and the delete is sent when the connection returns.
+4. **Sync drains the outbox and pulls changes.** It runs when the app is open and online, and from a background job otherwise ([background work](/core-patterns/background-work/)). Each outbox entry carries an ID so the server can ignore a repeat ([idempotency](/core-patterns/networking/#retries-and-idempotency)).
+5. **Conflicts have a written rule.** When the server and the device both changed a record, one documented rule decides the result.
+6. **Schema changes ship with migrations.** Every schema version has a tested path to the next.
+
+Android's guide describes this design under the name offline-first ([build an offline-first app](https://developer.android.com/topic/architecture/data-layer/offline-first)), and Flutter's guide has the same pattern ([offline-first support](https://docs.flutter.dev/app-architecture/design-patterns/offline-first)).
+
+## An observable query in each stack
+
+The same job in each stack: a notes table, a query the UI observes, and an insert.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Entity(tableName = "notes")
+data class NoteEntity(
+    @PrimaryKey val id: String,
+    val body: String,
+    val updatedAt: Long,
+    val pinned: Boolean = false,
+)
+
+@Dao
+interface NoteDao {
+    @Query("SELECT * FROM notes ORDER BY updatedAt DESC")
+    fun observeAll(): Flow<List<NoteEntity>>   // emits again after every change
+
+    @Upsert
+    suspend fun upsert(note: NoteEntity)
+}
+
+@Database(entities = [NoteEntity::class], version = 2)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun noteDao(): NoteDao
+}
+```
+Room generates the implementation from annotated interfaces and checks the SQL against the schema at compile time ([save data with Room](https://developer.android.com/training/data-storage/room)). A query that returns a `Flow` re-runs whenever its tables change. Room 3.0 (`androidx.room3`, stable since July 2026) is a Kotlin-first rewrite: coroutine-only, KSP-only and built on a multiplatform SQLite driver in place of Android's `SupportSQLite` API ([Room 3.0 release notes](https://developer.android.com/jetpack/androidx/releases/room3)). Most existing apps are on Room 2.x in the `androidx.room` package. Settings go in DataStore (1.2), which replaces `SharedPreferences` with an asynchronous, transactional API ([DataStore](https://developer.android.com/topic/libraries/architecture/datastore)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+@Model
+final class Note {
+    @Attribute(.unique) var id: UUID
+    var body: String
+    var updatedAt: Date
+    var pinned: Bool = false
+
+    init(id: UUID = UUID(), body: String, updatedAt: Date = .now) {
+        self.id = id
+        self.body = body
+        self.updatedAt = updatedAt
+    }
+}
+
+struct NotesScreen: View {
+    @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
+    @Environment(\.modelContext) private var context
+
+    var body: some View {
+        List(notes) { Text($0.body) }
+            .toolbar {
+                Button("Add") { context.insert(Note(body: "")) }
+            }
+    }
+}
+
+// In the App: WindowGroup { NotesScreen() }.modelContainer(for: Note.self)
+```
+SwiftData (iOS 17+) turns a class marked `@Model` into a persisted type, and `@Query` keeps a view's array in step with the store ([SwiftData](https://developer.apple.com/documentation/swiftdata)). Its default store is Core Data's SQLite store, and Core Data remains in most apps older than 2023 ([Core Data](https://developer.apple.com/documentation/coredata)). Teams that want to write SQL use [GRDB](https://github.com/groue/GRDB.swift), a third-party SQLite library with observable queries. Settings go in `UserDefaults`, read in SwiftUI through `@AppStorage`. Secrets go in the Keychain ([keychain services](https://developer.apple.com/documentation/security/keychain-services)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import { SQLiteProvider, useSQLiteContext, type SQLiteDatabase } from 'expo-sqlite';
+import { drizzle, useLiveQuery } from 'drizzle-orm/expo-sqlite';
+import { desc } from 'drizzle-orm';
+import { notes } from './schema';   // table definition in TypeScript
+
+function NotesScreen() {
+  const db = drizzle(useSQLiteContext());
+
+  // Re-runs when the notes table changes.
+  const { data } = useLiveQuery(
+    db.select().from(notes).orderBy(desc(notes.updatedAt)),
+  );
+
+  const add = () =>
+    db.insert(notes).values({ id: uuid(), body: '', updatedAt: Date.now() });
+
+  return <NoteList notes={data} onAdd={add} />;
+}
+
+export default function App() {
+  return (
+    <SQLiteProvider
+      databaseName="notes.db"
+      options={{ enableChangeListener: true }}
+      onInit={migrate}
+    >
+      <NotesScreen />
+    </SQLiteProvider>
+  );
+}
+```
+`expo-sqlite` gives JavaScript a SQLite database with synchronous and asynchronous APIs and a change listener ([expo-sqlite](https://docs.expo.dev/versions/latest/sdk/sqlite/)). Drizzle ORM adds typed queries, generated migrations and the `useLiveQuery` hook on top of it ([Drizzle with Expo SQLite](https://orm.drizzle.team/docs/connect-expo-sqlite)). For settings, `react-native-mmkv` (4.x) is a synchronous key-value store ([react-native-mmkv](https://github.com/mrousavy/react-native-mmkv)), and `AsyncStorage` is the older asynchronous one. Secrets go in `expo-secure-store`, which uses the Keychain and the Android Keystore ([SecureStore](https://docs.expo.dev/versions/latest/sdk/securestore/)). For server data that only needs to survive a restart as a cache, TanStack Query can persist its cache to storage ([persistQueryClient](https://tanstack.com/query/latest/docs/framework/react/plugins/persistQueryClient)).
+</TabItem>
+<TabItem label="Flutter">
+```dart
+class Notes extends Table {
+  TextColumn get id => text()();
+  TextColumn get body => text()();
+  DateTimeColumn get updatedAt => dateTime()();
+  BoolColumn get pinned => boolean().withDefault(const Constant(false))();
+
+  @override
+  Set<Column> get primaryKey => {id};
+}
+
+@DriftDatabase(tables: [Notes])
+class AppDatabase extends _$AppDatabase {
+  AppDatabase() : super(driftDatabase(name: 'notes'));
+
+  @override
+  int get schemaVersion => 2;
+
+  // Emits again after every change to the notes table.
+  Stream<List<Note>> watchNotes() =>
+      (select(notes)..orderBy([(n) => OrderingTerm.desc(n.updatedAt)])).watch();
+
+  Future<void> upsert(NotesCompanion note) =>
+      into(notes).insertOnConflictUpdate(note);
+}
+```
+Flutter has no built-in database, so a package provides one. `drift` (2.x) defines tables in Dart, generates typed queries and turns any query into a `Stream` with `watch()` ([drift documentation](https://drift.simonbinder.eu/)). `sqflite` is the lower-level option with raw SQL ([persist data with SQLite](https://docs.flutter.dev/cookbook/persistence/sqlite)). Settings go in `shared_preferences`, which wraps `SharedPreferences` or DataStore on Android and `UserDefaults` on iOS ([shared_preferences](https://pub.dev/packages/shared_preferences)). Secrets go in `flutter_secure_storage`.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: the Room entity, DAO and database from the Android tab,
+// with imports from androidx.room3, plus a constructor per platform.
+@Database(entities = [NoteEntity::class], version = 2)
+@ConstructedBy(AppDatabaseConstructor::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun noteDao(): NoteDao
+}
+
+@Suppress("KotlinNoActualForExpect")
+expect object AppDatabaseConstructor : RoomDatabaseConstructor<AppDatabase>
+
+// iosMain: each platform says where the file lives.
+fun createDatabase(): AppDatabase =
+    Room.databaseBuilder<AppDatabase>(name = documentsDirectory() + "/notes.db")
+        .setDriver(BundledSQLiteDriver())
+        .build()
+```
+Room is multiplatform: entities, DAOs and queries sit in `commonMain`, and Room 3.0 targets Android, iOS, desktop, JavaScript and Wasm ([Room for KMP](https://developer.android.com/kotlin/multiplatform/room)). `BundledSQLiteDriver` ships one SQLite version inside the app on every platform, so queries behave the same everywhere. SQLDelight (2.4) takes the opposite approach to Room: you write `.sq` files of SQL and it generates typed Kotlin, with `asFlow()` for observable queries ([SQLDelight](https://sqldelight.github.io/sqldelight/latest/)). DataStore is multiplatform as well ([DataStore for KMP](https://developer.android.com/kotlin/multiplatform/datastore)). Secrets need `expect`/`actual` code over the Keychain and the Keystore, or a library that wraps them.
+</TabItem>
+</Tabs>
+
+## Migrations
+
+The launch crash from the opening happened because version 2.3 expected a `pinned` column and the file on disk came from 2.1. A migration is code that changes an existing database file from schema version N to N+1. On update, the library runs every step between the version on disk and the current one.
+
+| Stack | Schema version | Migration mechanism |
+| --- | --- | --- |
+| Room | `version` in `@Database` | `@AutoMigration` for additive changes, `Migration` objects for the rest, exported schema JSON for tests ([migrate your Room database](https://developer.android.com/training/data-storage/room/migrating-db-versions)) |
+| SwiftData | `VersionedSchema` | Automatic lightweight migration, or stages in a `SchemaMigrationPlan` ([SchemaMigrationPlan](https://developer.apple.com/documentation/swiftdata/schemamigrationplan)) |
+| expo-sqlite + Drizzle | Migration files | `drizzle-kit` generates SQL files, applied at startup with `useMigrations` |
+| drift | `schemaVersion` | `MigrationStrategy.onUpgrade`, with generated step-by-step helpers ([drift migrations](https://drift.simonbinder.eu/migrations/)) |
+| SQLDelight | Numbered `.sqm` files | Each file holds the SQL from one version to the next ([SQLDelight migrations](https://sqldelight.github.io/sqldelight/latest/android_sqlite/migrations/)) |
+
+Rules that hold for all of them:
+
+- Commit the schema of every released version to the repository. The migration test opens a database at each old version, runs the migrations and checks the result.
+- Test the long jump. Users skip releases, so 2.1 to 2.6 runs five migrations in a row.
+- Prefer additive changes: a new nullable column or a new table. Renames and type changes need data copied by hand.
+- Never edit a migration that has shipped. Write a new one.
+
+<Aside type="caution" title="Watch it!">
+Room's `fallbackToDestructiveMigration` deletes the user's data whenever a migration path is missing. It suits a pure cache that can be refetched. In an offline-first app the database holds unsynced edits, and wiping it loses work the server has never seen ([migrating Room databases](https://developer.android.com/training/data-storage/room/migrating-db-versions)).
+</Aside>
+
+## Sync and conflicts
+
+Sync has two directions. Push sends the outbox to the server in order. Pull asks the server for everything that changed since the last sync, using a cursor or timestamp the server issued, and applies it to the local database in a transaction.
+
+A conflict happens when the device and the server changed the same record between two syncs. The lost edit from the opening was an unhandled conflict: the second write overwrote the first.
+
+```d2
+classes: {
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  warn: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 4
+grid-columns: 3
+grid-gap: 12
+h1: "Rule" { class: head }
+h2: "Result" { class: head }
+h3: "Fits" { class: head }
+a1: "Last write wins" { class: box }
+a2: "Newest timestamp\nreplaces the record" { class: warn }
+a3: "Settings, read state,\nsingle-user data" { class: box }
+b1: "Merge per field" { class: box }
+b2: "Title from one edit,\nbody from the other" { class: ok }
+b3: "Forms, profiles,\ntask attributes" { class: box }
+c1: "Ask the user" { class: box }
+c2: "Both versions kept,\nuser picks" { class: ok }
+c3: "Documents,\nlong text" { class: box }
+```
+
+Last write wins is the simplest rule and loses data when two people or two devices edit the same record. It also depends on clocks, and a phone's clock can be wrong, so compare versions issued by the server where you can. Collaborative editing of the same text needs a data type built for merging (a CRDT), which is a project of its own.
+
+Sync engines take over this work. Cloud Firestore keeps a local cache and queues writes while offline ([Firestore offline data](https://firebase.google.com/docs/firestore/manage-data/enable-offline)). SwiftData and Core Data can mirror a store to CloudKit for a user's own devices ([syncing model data across devices](https://developer.apple.com/documentation/swiftdata/syncing-model-data-across-a-persons-devices)). They save months of work, and they tie your data model to the service.
+
+## Trade-offs and scale
+
+**Not every feature needs offline writes.** Reading cached data offline is cheap: store what you fetched. Writing offline brings the outbox, conflicts and partial failures. Decide per feature. A notes app needs offline writes. A payment should require a connection and say so.
+
+**Show sync state.** The user needs to know whether a note has reached the server. Keep a `syncState` column (`pending`, `synced`, `failed`) and show it. Surface an edit the server rejected, and never drop it silently.
+
+**Deletes need a marker.** If the device deletes the row at once, sync has nothing left to send, and a later pull may bring the row back. Mark the row as deleted (a tombstone), hide it from queries and remove it after the server confirms.
+
+**Sign-out and multiple accounts.** Data from one account must not appear in the next. Use one database file per account, or delete everything on sign-out, including the outbox, the key-value store and cached files.
+
+**Backups restore more than you expect.** A restored device can receive an old database and an old token. Exclude files that hold tokens and device-specific IDs from backup, and make sync cope with a database older than the server remembers ([Auto Backup](https://developer.android.com/identity/data/autobackup)).
+
+**Encryption at rest.** Both platforms encrypt app storage with keys tied to the device lock. For an additional layer (health or financial data), SQLCipher encrypts the database file, with the key held in the Keystore or Keychain.
+
+**Large tables need paging.** A query that returns 50,000 rows blocks whichever thread runs it. Page from the database with `LIMIT` and an index, through Paging 3 on Android or the list's own lazy loading elsewhere ([concurrency](/foundations/concurrency/)).
+
+<NoDumbQuestions>
+<dt>Is offline-first the same as caching?</dt>
+<dd>Caching keeps a copy of server data so reads work offline. Offline-first also accepts writes offline and syncs them later, which requires the outbox and a conflict rule.</dd>
+
+<dt>Can I store my list as JSON in the key-value store?</dt>
+<dd>For ten items that never get queried, yes. The whole value is rewritten on every change and loaded whole on every read, and you get no queries, no partial updates and no migrations. Move to a database when the list grows or needs filtering.</dd>
+
+<dt>Why do IDs in the samples come from the client?</dt>
+<dd>An offline device cannot ask the server for the next ID. The app generates a UUID, uses it locally at once and sends it with the create request. The same ID then doubles as the idempotency key.</dd>
+
+<dt>Realm, Isar, ObjectBox, WatermelonDB: should I use one instead of SQLite?</dt>
+<dd>Check who maintains it first. MongoDB shut down Atlas Device Sync, the sync service behind Realm, on September 30, 2025, and deprecated the Realm SDKs with it (<a href="https://www.mongodb.com/docs/device-sync-deprecation/">deprecation notice</a>). Apps built on it had to migrate their storage and their sync. SQLite-based libraries share a file format that every tool can open, and the official guides for every stack in this book use them.</dd>
+
+<dt>Where do downloaded images go?</dt>
+<dd>In files. Image loading libraries (Coil, Kingfisher, expo-image, cached_network_image) keep their own disk cache in the cache directory, which the OS may clear. Files the user created or explicitly downloaded go in the app's documents directory, with their paths in the database.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Database library | Room | SwiftData, Core Data | expo-sqlite (+ Drizzle) | drift, sqflite | Room, SQLDelight |
+| Table definition | `@Entity` class | `@Model` class | Drizzle table object | `Table` class | `@Entity`, `.sq` file |
+| Observable query | DAO returning `Flow` | `@Query` | `useLiveQuery` | `.watch()` stream | `Flow` |
+| Transaction | `withTransaction`, `@Transaction` | `ModelContext.transaction` | `withTransactionAsync` | `transaction()` | `useWriterConnection`, `transaction` |
+| Schema migration | `Migration`, `@AutoMigration` | `SchemaMigrationPlan` | Generated SQL files | `MigrationStrategy` | `Migration`, `.sqm` files |
+| Settings store | DataStore | `UserDefaults`, `@AppStorage` | MMKV, AsyncStorage | `shared_preferences` | DataStore |
+| Secret store | Keystore-encrypted storage | Keychain | `expo-secure-store` | `flutter_secure_storage` | `expect`/`actual` over both |
+| Files directory | `filesDir` | Documents, Application Support | `expo-file-system` document directory | `path_provider` documents directory | Per platform |
+| Cache directory | `cacheDir` | Caches | `expo-file-system` cache directory | `path_provider` cache directory | Per platform |
+| Sync trigger | WorkManager | `BGTaskScheduler` | `expo-background-task` | `workmanager` plugin | Per platform |
+
+<Exercise>
+A field service app lets technicians fill in a job report with text, a few checkboxes and photos, often in basements with no signal. For each item, name the store and say what sync has to do.
+
+1. The technician's session token.
+2. The list of jobs assigned for today.
+3. A report the technician is filling in.
+4. The photos attached to the report.
+5. The "use dark theme" switch.
+
+<Fragment slot="answer">
+1. Keychain or Keystore-backed secure storage, excluded from backup. Nothing to sync.
+2. A database table, filled by pull sync. The screen observes the query, so yesterday's cached list shows at once and updates when the pull finishes.
+3. A database row with a client-generated ID and a `pending` sync state, plus an outbox entry. Push sync sends it when a connection exists. A per-field merge rule suits it if the office can edit the same report.
+4. Files in the app's documents directory, with a row per photo holding the path and upload state. Upload them with a background transfer that resumes, after the report itself has synced.
+5. The key-value settings store. No sync, unless the product wants settings to follow the account.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** uses `sqlite-net` or EF Core over SQLite, `Preferences` for settings and `SecureStorage` for secrets.
+- **Ionic / Capacitor** uses the Preferences plugin for settings and a SQLite plugin for data. Browser storage inside the WebView can be cleared by the OS, so it is not a safe place for user data.
+- **Lynx** has no built-in database. Persistent storage goes through native modules provided by the host app.
+
+## Sources
+
+- Android: [Build an offline-first app](https://developer.android.com/topic/architecture/data-layer/offline-first), [Save data with Room](https://developer.android.com/training/data-storage/room), [Room 3.0 release notes](https://developer.android.com/jetpack/androidx/releases/room3), [Room 3.0: modernizing the Room](https://android-developers.googleblog.com/2026/03/room-30-modernizing-room.html), [Migrate your Room database](https://developer.android.com/training/data-storage/room/migrating-db-versions), [DataStore](https://developer.android.com/topic/libraries/architecture/datastore) (1.2), [Auto Backup](https://developer.android.com/identity/data/autobackup)
+- iOS: [SwiftData](https://developer.apple.com/documentation/swiftdata), [SchemaMigrationPlan](https://developer.apple.com/documentation/swiftdata/schemamigrationplan), [Syncing model data across a person's devices](https://developer.apple.com/documentation/swiftdata/syncing-model-data-across-a-persons-devices), [Core Data](https://developer.apple.com/documentation/coredata), [Keychain services](https://developer.apple.com/documentation/security/keychain-services), [GRDB](https://github.com/groue/GRDB.swift)
+- React Native: [expo-sqlite](https://docs.expo.dev/versions/latest/sdk/sqlite/), [Drizzle with Expo SQLite](https://orm.drizzle.team/docs/connect-expo-sqlite), [react-native-mmkv](https://github.com/mrousavy/react-native-mmkv) (4.x), [SecureStore](https://docs.expo.dev/versions/latest/sdk/securestore/), [persistQueryClient](https://tanstack.com/query/latest/docs/framework/react/plugins/persistQueryClient)
+- Flutter: [Offline-first support](https://docs.flutter.dev/app-architecture/design-patterns/offline-first), [Persist data with SQLite](https://docs.flutter.dev/cookbook/persistence/sqlite), [drift](https://drift.simonbinder.eu/) (2.x), [drift migrations](https://drift.simonbinder.eu/migrations/), [shared_preferences](https://pub.dev/packages/shared_preferences)
+- KMP / CMP: [Room for KMP](https://developer.android.com/kotlin/multiplatform/room), [DataStore for KMP](https://developer.android.com/kotlin/multiplatform/datastore), [SQLDelight](https://sqldelight.github.io/sqldelight/latest/) (2.4), [SQLDelight migrations](https://sqldelight.github.io/sqldelight/latest/android_sqlite/migrations/)
+- Sync: [Firestore offline data](https://firebase.google.com/docs/firestore/manage-data/enable-offline), [MongoDB: Atlas Device Sync deprecation](https://www.mongodb.com/docs/device-sync-deprecation/)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 7 (offline support)

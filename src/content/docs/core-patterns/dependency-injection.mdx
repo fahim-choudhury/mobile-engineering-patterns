@@ -1,0 +1,363 @@
+---
+title: Dependency injection and modularization
+description: How each stack hands objects their collaborators, with Hilt, Metro, Koin, SwiftUI's environment, React context and Riverpod, and how a codebase is split into modules that build and change independently.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+An app grows from three engineers to thirty. The complaints change from bug reports to these:
+
+- The checkout tests hit the real payment API, because `CheckoutViewModel` creates its own `PaymentApi()`.
+- A user signs out and another signs in. The new user sees the previous user's cart, held by a singleton nobody reset.
+- Changing one string takes a twelve-minute build.
+- The search team changed a helper class, and the profile screen broke. Nobody knew profile used it.
+
+The first two are about how objects get their collaborators. The last two are about how code is divided. The chapter covers both because the second problem cannot be solved without the first: modules that must not know each other still need each other's objects at runtime.
+
+<BrainPower>
+`CheckoutViewModel` needs a `PaymentApi`. `PaymentApi` needs an `HttpClient` and a `TokenStore`. `TokenStore` needs secure storage. Where in an app should the code live that knows this entire chain?
+</BrainPower>
+
+## Constraints on a phone
+
+- **The OS creates your entry points.** Android instantiates activities and services, iOS instantiates the app delegate and scenes. You cannot pass arguments to their constructors, so the first object in every chain has to fetch its dependencies from somewhere ([runtime anatomy](/foundations/runtime-anatomy/)).
+- **Objects have different lifetimes.** An HTTP client lives as long as the process. A cart lives as long as a signed-in session. A ViewModel lives as long as a screen ([app lifecycle](/foundations/app-lifecycle/)).
+- **Startup time is visible.** Work done to build the object graph at launch delays the first frame. Resolving dependencies by reflection at runtime costs more than code generated at build time.
+- **One binary ships everything.** All teams' code is compiled and linked into one app and released together, so build time and merge conflicts grow with the team.
+
+## Dependency injection: the pattern
+
+1. **Classes ask, they don't create.** A class declares what it needs as constructor parameters and never constructs or looks up its collaborators.
+2. **Depend on interfaces at the boundaries.** `CheckoutViewModel` takes a `PaymentApi` interface. Production passes the real client and a test passes a fake.
+3. **One place builds the graph.** The code that knows which implementation satisfies which interface sits at the edge of the app, in what is called the composition root. This answers the Brain Power question.
+4. **Scopes tie lifetimes to owners.** "One per app", "one per signed-in user" and "one per screen" are declared, and the container creates and discards objects to match.
+
+```d2
+classes: {
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  user: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  screen: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+appscope: "App scope: lives with the process" {
+  style.font-size: 18
+  grid-columns: 3
+  grid-gap: 12
+  http: "HttpClient" { class: app }
+  db: "Database" { class: app }
+  analytics: "Analytics" { class: app }
+}
+userscope: "User scope: created at sign-in, discarded at sign-out" {
+  style.font-size: 18
+  grid-columns: 3
+  grid-gap: 12
+  tokens: "TokenStore" { class: user }
+  cart: "CartRepository" { class: user }
+  payments: "PaymentApi" { class: user }
+}
+screenscope: "Screen scope: lives with the screen" {
+  style.font-size: 18
+  grid-columns: 2
+  grid-gap: 12
+  checkout: "CheckoutViewModel" { class: screen }
+  cartvm: "CartViewModel" { class: screen }
+}
+screenscope -> userscope: "depends on" { style.font-size: 16 }
+userscope -> appscope: "depends on" { style.font-size: 16 }
+```
+
+A shorter-lived object may depend on a longer-lived one. The reverse is a bug: an app-scoped singleton that holds a user's cart keeps it after sign-out, which is the second complaint from the opening. A user scope that is thrown away at sign-out removes that whole class of leak.
+
+Dependency injection needs no library. Passing arguments to constructors by hand is DI, and Android's own guide starts there ([manual dependency injection](https://developer.android.com/training/dependency-injection/manual)). Libraries remove the boilerplate once the graph has hundreds of nodes, and they differ mainly in when a missing dependency is caught: at build time or when the code first runs.
+
+## Providing a repository in each stack
+
+The same job in each stack: a `CheckoutViewModel` (or its equivalent) receives a `PaymentApi`, production wires the real one, and a test swaps in a fake.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+interface PaymentApi { suspend fun pay(order: Order): Receipt }
+
+class HttpPaymentApi @Inject constructor(
+    private val client: OkHttpClient,
+) : PaymentApi { /* ... */ }
+
+@Module
+@InstallIn(SingletonComponent::class)          // app scope
+abstract class PaymentModule {
+    @Binds @Singleton
+    abstract fun paymentApi(impl: HttpPaymentApi): PaymentApi
+}
+
+@HiltViewModel
+class CheckoutViewModel @Inject constructor(
+    private val payments: PaymentApi,          // asks, does not create
+) : ViewModel()
+
+@AndroidEntryPoint                              // Hilt injects OS-created classes
+class MainActivity : ComponentActivity()
+
+// Test: construct it by hand with a fake.
+val viewModel = CheckoutViewModel(payments = FakePaymentApi())
+```
+Hilt is the library Android's documentation recommends. It generates the graph at build time on top of Dagger and provides scopes that follow Android lifecycles: `SingletonComponent`, `ActivityRetainedComponent`, `ViewModelComponent` ([dependency injection with Hilt](https://developer.android.com/training/dependency-injection/hilt-android)). A missing binding is a build error. The cost is annotation processing time and generated code. [Metro](https://zacsweers.github.io/metro/latest/) (1.0) does the same validation as a Kotlin compiler plugin with no separate processing step, and works on Kotlin Multiplatform. [Koin](https://insert-koin.io/) is covered in the KMP tab.
+</TabItem>
+<TabItem label="iOS">
+```swift
+protocol PaymentAPI: Sendable {
+    func pay(_ order: Order) async throws -> Receipt
+}
+
+@MainActor @Observable
+final class CheckoutModel {
+    private let payments: PaymentAPI
+    init(payments: PaymentAPI) { self.payments = payments }   // initializer injection
+}
+
+// Shared services travel through the SwiftUI environment.
+extension EnvironmentValues {
+    @Entry var payments: PaymentAPI = HTTPPaymentAPI()
+}
+
+struct CheckoutScreen: View {
+    @Environment(\.payments) private var payments
+    @State private var model: CheckoutModel?
+
+    var body: some View {
+        CheckoutContent(model: model)
+            .task { model = model ?? CheckoutModel(payments: payments) }
+    }
+}
+
+// Preview or test: override for a subtree.
+CheckoutScreen().environment(\.payments, FakePaymentAPI())
+```
+iOS has no official DI library. The baseline is initializer injection with protocols, wired in the `App` struct or a small container type. SwiftUI's environment passes values down the view tree, and the `@Entry` macro (Xcode 16+) declares a key in one line ([Entry macro](https://developer.apple.com/documentation/swiftui/entry())). A view reads from the environment and hands the value to its model. Third-party libraries fill the gap for larger graphs: [Factory](https://github.com/hmlongco/Factory) is a container with scopes, and [swift-dependencies](https://github.com/pointfreeco/swift-dependencies) provides a `@Dependency` property wrapper with overrides for tests and previews. Both resolve at runtime.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+type PaymentApi = { pay(order: Order): Promise<Receipt> };
+
+const PaymentApiContext = createContext<PaymentApi | null>(null);
+
+export function usePaymentApi() {
+  const api = useContext(PaymentApiContext);
+  if (!api) throw new Error('PaymentApiContext is missing a provider');
+  return api;
+}
+
+function CheckoutScreen() {
+  const payments = usePaymentApi();          // asks, does not create
+  const pay = useMutation({ mutationFn: payments.pay });
+  return <Button title="Pay" onPress={() => pay.mutate(order)} />;
+}
+
+// Composition root.
+export default function App() {
+  return (
+    <PaymentApiContext value={httpPaymentApi}>
+      <CheckoutScreen />
+    </PaymentApiContext>
+  );
+}
+
+// Test: wrap with a fake.
+render(
+  <PaymentApiContext value={fakePaymentApi}>
+    <CheckoutScreen />
+  </PaymentApiContext>,
+);
+```
+JavaScript apps rarely use a DI container. The module system is the default mechanism: a file imports a singleton, and tests replace the module with `jest.mock` ([Jest mock functions](https://jestjs.io/docs/mock-functions)). That is quick, and it hides a component's dependencies from its signature. React context is the explicit form, giving each subtree its own instance: a provider at the root for production and another in a test ([passing data deeply with context](https://react.dev/learn/passing-data-deeply-with-context)). A user scope is a provider mounted only while someone is signed in. Unmounting it discards everything inside.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+abstract interface class PaymentApi {
+  Future<Receipt> pay(Order order);
+}
+
+// The provider is the binding. Riverpod builds it on first use.
+final paymentApiProvider = Provider<PaymentApi>(
+  (ref) => HttpPaymentApi(ref.watch(dioProvider)),
+);
+
+class CheckoutNotifier extends Notifier<CheckoutState> {
+  @override
+  CheckoutState build() => const CheckoutState.idle();
+
+  Future<void> pay(Order order) async {
+    final receipt = await ref.read(paymentApiProvider).pay(order);
+    state = CheckoutState.paid(receipt);
+  }
+}
+
+// Test: override the binding.
+final container = ProviderContainer(
+  overrides: [paymentApiProvider.overrideWithValue(FakePaymentApi())],
+);
+```
+Flutter's architecture guide recommends constructor injection and uses `package:provider` to place objects in the widget tree ([dependency injection](https://docs.flutter.dev/app-architecture/case-study/dependency-injection)). Riverpod (3.x), shown here, keeps providers outside the tree, lets one provider depend on another through `ref`, and supports overrides per test or per subtree ([provider overrides](https://riverpod.dev/docs/concepts2/overrides)). `get_it` is a service locator: you register instances at startup and call `getIt<PaymentApi>()` anywhere ([get_it](https://pub.dev/packages/get_it)). All three resolve at runtime.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain
+val sharedModule = module {
+    single<HttpClient> { createHttpClient(get()) }
+    single<PaymentApi> { KtorPaymentApi(get()) }
+    viewModel { CheckoutViewModel(get()) }
+}
+
+// Each platform contributes what only it can build.
+expect val platformModule: Module       // e.g. the SQLite driver, secure storage
+
+fun initKoin() = startKoin { modules(sharedModule, platformModule) }
+
+// commonMain, Compose Multiplatform
+@Composable
+fun CheckoutScreen(viewModel: CheckoutViewModel = koinViewModel()) { /* ... */ }
+```
+Hilt is Android-only, so shared code uses a multiplatform library. Koin (4.2) describes the graph in a Kotlin DSL and resolves it at runtime. Its compiler plugin (stable since 1.0 in 2026) adds build-time verification of the graph ([Koin for KMP](https://insert-koin.io/docs/reference/koin-mp/kmp/), [Koin releases](https://insert-koin.io/docs/support/releases/)). Metro (1.0) and [kotlin-inject](https://github.com/evant/kotlin-inject) generate the graph at build time for all targets. The `expect`/`actual` mechanism supplies the platform-specific pieces ([expected and actual declarations](https://kotlinlang.org/docs/multiplatform/multiplatform-expect-actual.html)). With a SwiftUI front end, the iOS app calls `initKoin()` at launch and pulls ViewModels from a small Kotlin helper, because Swift cannot call Koin's reified `get()` functions directly.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+A service locator call such as `getIt<PaymentApi>()` or `KoinJavaComponent.get()` inside a class body hides the dependency. The class compiles with no trace of what it needs, and a test finds out when the lookup fails. Keep lookups at the edges (the composition root, the entry points the OS creates) and pass everything else through constructors.
+</Aside>
+
+## Modularization: the pattern
+
+A module is a unit the build system compiles on its own, with an explicit list of the modules it may use. Splitting an app into modules buys three things: a change rebuilds only the modules that depend on it, a module cannot reach code it has not declared, and each module has an owner.
+
+```d2
+classes: {
+  app: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  feat: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  core: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+app: "app\ncomposition root,\nnavigation wiring" { class: app }
+features: "Feature modules" {
+  style.font-size: 18
+  grid-columns: 3
+  grid-gap: 12
+  search: "feature-search" { class: feat }
+  checkout: "feature-checkout" { class: feat }
+  profile: "feature-profile" { class: feat }
+}
+cores: "Core modules" {
+  style.font-size: 18
+  grid-columns: 4
+  grid-gap: 12
+  ui: "design-system" { class: core }
+  data: "data" { class: core }
+  network: "network" { class: core }
+  model: "model" { class: core }
+}
+app -> features
+features -> cores
+```
+
+1. **Dependencies point one way.** The app module depends on features, features depend on core modules, and core modules depend on nothing above them.
+2. **Features do not depend on each other.** If checkout needs to open the profile screen, it navigates by route ([navigation](/core-patterns/navigation/)). If it needs profile data, that data belongs in a core module both can use.
+3. **Expose little.** Each module marks most of its code as internal and publishes a small API: a route, an interface, a few models.
+4. **The app module wires everything.** It is the only module that sees every feature, so it holds the DI graph and the navigation table.
+
+The twelve-minute build from the opening shrinks because the build system caches each module's output and recompiles only what a change can affect. The surprise breakage in the profile screen becomes a build error in review, or impossible, because search's helper was internal.
+
+| Stack | Module unit | Declared in | Hidden by default |
+| --- | --- | --- | --- |
+| Android, KMP | Gradle module | `build.gradle.kts` | No. Mark declarations `internal`, and use `implementation` to keep dependencies off consumers' classpaths |
+| iOS | Swift package target | `Package.swift` | Yes. Declarations are `internal` unless marked `public` |
+| React Native | Workspace package | `package.json` | Only what the package's `exports` field lists is importable |
+| Flutter | Dart package | `pubspec.yaml` | Files under `lib/src/` are private by convention, enforced by a lint |
+
+- **Android** documents the pattern in its modularization guide, with the Now in Android sample as the reference ([guide to app modularization](https://developer.android.com/topic/modularization), [common patterns](https://developer.android.com/topic/modularization/patterns)). Shared build configuration goes in Gradle convention plugins.
+- **iOS** teams use local Swift packages inside the app's repository. Each feature is a library target, and Xcode builds only the targets a change touches ([organizing your code with local packages](https://developer.apple.com/documentation/xcode/organizing-your-code-with-local-packages)).
+- **React Native** uses a monorepo with package manager workspaces. Metro, the bundler, follows workspace symlinks, and Expo detects the monorepo layout automatically ([Expo: work with monorepos](https://docs.expo.dev/guides/monorepos/)).
+- **Flutter** uses pub workspaces (Dart 3.6+), which resolve every package in the repository together ([pub workspaces](https://dart.dev/tools/pub/workspaces)). [Melos](https://melos.invertase.dev/) adds scripts that run across packages.
+- **KMP** modules are Gradle modules with source sets per platform. The iOS app can consume only one Kotlin framework, so the shared modules are collected into a single "umbrella" module that exports them ([project configuration](https://kotlinlang.org/docs/multiplatform/multiplatform-project-configuration.html)).
+
+## Trade-offs and scale
+
+**Compile-time or runtime graph.** A build-time graph (Hilt, Metro, kotlin-inject) reports a missing binding before the app runs, and costs build time and stricter rules. A runtime graph (Koin's DSL, get_it, Factory, context) is quick to write and fails when the code path first executes. With a runtime graph, add a test that resolves every binding. Koin ships a verification API for this purpose ([verifying your Koin configuration](https://insert-koin.io/docs/reference/koin-test/verify/)).
+
+**Split implementation from API when features must talk.** A `feature-profile-api` module holds the route and an interface. `feature-profile` implements them. Checkout depends on the small API module, so a change inside profile's implementation does not rebuild checkout. This doubles the module count, so apply it to modules that many others depend on.
+
+**Module count has a cost.** Each module adds configuration and build-graph overhead. A three-person app with forty modules spends more time on build files than it saves. Split when a boundary has a reason: a team, a feature that could be removed, or a layer that many features share.
+
+**Enforce the rules mechanically.** A diagram of allowed dependencies stops being true within months. Check it in CI: Gradle's dependency analysis plugins, Swift package target dependencies, ESLint import restrictions or Dart's lints. Add a code owners file so that changes to a module request review from its team.
+
+**Lazy initialization protects startup.** An app-scoped graph should construct objects when first used. Hilt and Dagger offer `Lazy<T>` and `Provider<T>`, Koin and Riverpod are lazy by default, and get_it has `registerLazySingleton`. The [performance chapter](/shipping/performance/) covers measuring startup.
+
+**Larger apps outgrow the default build system.** Past a few hundred modules, some companies move to Bazel or Buck for remote caching and precise dependency tracking, and build a platform team around it. [Many teams, one app](/architecture/many-teams/) covers that step.
+
+<NoDumbQuestions>
+<dt>Is a singleton the same as app scope?</dt>
+<dd>A scoped object in a DI graph is created once per scope and handed to whoever asks. A global singleton (`object`, `static let shared`) is reached directly from anywhere, cannot be replaced in a test and cannot be discarded at sign-out. The lifetime is the same, and the access pattern is the difference.</dd>
+
+<dt>Do I need a DI library at all?</dt>
+<dd>A small app is fine with one container class that builds everything by hand and passes it down. Reach for a library when the hand-written wiring becomes a file people avoid touching, or when you need scopes that follow lifecycles.</dd>
+
+<dt>How does DI reach an Activity if the OS constructs it?</dt>
+<dd>Through member injection at the entry point. Hilt's `@AndroidEntryPoint` generates code that fills the activity's `@Inject` fields in `onCreate`. From there down, everything uses constructor injection. iOS and the cross-platform stacks have the same seam at the `App` struct, the root component or `main()`.</dd>
+
+<dt>Should every feature be a module from day one?</dt>
+<dd>Start with a few layer modules (app, data, design system) and one module per feature that a separate team owns. Keeping the code organised by feature folder inside a module makes a later split cheap.</dd>
+
+<dt>Do modules make the app smaller or faster to start?</dt>
+<dd>No. Modules are a build-time and team structure, and they are linked into one binary. Shipping part of the app on demand is a separate mechanism: Play Feature Delivery on Android and Background Assets or on-demand resources on iOS.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Usual DI tool | Hilt | Initializer injection, environment | Module imports, context | Riverpod, `provider`, `get_it` | Koin, Metro, kotlin-inject |
+| Graph checked at | Build | Run | Run | Run | Build (Metro, Koin compiler plugin) or run |
+| Declare a binding | `@Binds`, `@Provides` | Container property, `@Entry` | `<Context value>` | `Provider((ref) => ...)` | `single { }`, `@Provides` |
+| Ask for a dependency | `@Inject constructor` | `init` parameter, `@Environment` | Hook reading context | `ref.watch`, constructor | Constructor, `get()` |
+| App scope | `@Singleton` | Object owned by `App` | Provider at the root | Root `ProviderScope` | `single { }` |
+| Screen scope | `@HiltViewModel` | `@State` model in the view | Component state | Auto-dispose provider | `viewModel { }` |
+| Replace in a test | Pass a fake, `@TestInstallIn` | Pass a fake, `.environment` | Fake provider, `jest.mock` | `overrides` | Pass a fake, test module |
+| Module unit | Gradle module | Swift package target | Workspace package | Dart package | Gradle module |
+| Hide internals | `internal` | Default `internal` access | `exports` field | `lib/src/` | `internal` |
+| Shared build config | Convention plugins | `Package.swift`, xcconfig | Shared tsconfig and ESLint presets | `analysis_options.yaml`, Melos | Convention plugins |
+
+<Exercise>
+A banking app has these objects. Give each a scope (app, user or screen) and say what breaks with the wrong one.
+
+1. `HttpClient` with its connection pool.
+2. `AccountRepository`, which caches the signed-in customer's accounts.
+3. `TransferViewModel`, which holds the amount being typed.
+4. `Analytics`, which batches events.
+5. `BiometricPrompt` helper, which needs the current Activity or view controller.
+
+<Fragment slot="answer">
+1. App scope. One pool is shared by every request. A new client per screen would open new connections each time and waste the pool.
+2. User scope. At app scope, the next person to sign in on the device sees the previous customer's accounts.
+3. Screen scope. At user scope, the half-typed amount would reappear the next time the transfer screen opens.
+4. App scope. Events happen before sign-in and after sign-out. It should not hold user data beyond an ID that is cleared at sign-out.
+5. Screen scope, or the scope of the Activity. Held at app scope, it keeps a reference to a destroyed Activity, which is a memory leak and a crash when the prompt is shown.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** has DI built in through `Microsoft.Extensions.DependencyInjection`, with singleton, scoped and transient lifetimes registered in `MauiProgram`. Modules are .NET projects.
+- **Ionic / Capacitor** follows its web framework. Angular has a hierarchical injector with providers per component subtree.
+- **Lynx** apps use JavaScript module imports and React context, as in the React Native tab.
+
+## Sources
+
+- Android: [Dependency injection in Android](https://developer.android.com/training/dependency-injection), [Manual dependency injection](https://developer.android.com/training/dependency-injection/manual), [Dependency injection with Hilt](https://developer.android.com/training/dependency-injection/hilt-android), [Guide to Android app modularization](https://developer.android.com/topic/modularization), [Common modularization patterns](https://developer.android.com/topic/modularization/patterns), [Metro](https://zacsweers.github.io/metro/latest/) (1.0), [Metro is stable](https://www.zacsweers.dev/metro-is-stable/)
+- iOS: [Entry macro](https://developer.apple.com/documentation/swiftui/entry()), [EnvironmentValues](https://developer.apple.com/documentation/swiftui/environmentvalues), [Organizing your code with local packages](https://developer.apple.com/documentation/xcode/organizing-your-code-with-local-packages), [Factory](https://github.com/hmlongco/Factory), [swift-dependencies](https://github.com/pointfreeco/swift-dependencies)
+- React Native: [Passing data deeply with context](https://react.dev/learn/passing-data-deeply-with-context), [Jest mock functions](https://jestjs.io/docs/mock-functions), [Expo: work with monorepos](https://docs.expo.dev/guides/monorepos/)
+- Flutter: [Dependency injection case study](https://docs.flutter.dev/app-architecture/case-study/dependency-injection), [Riverpod provider overrides](https://riverpod.dev/docs/concepts2/overrides), [get_it](https://pub.dev/packages/get_it), [Pub workspaces](https://dart.dev/tools/pub/workspaces), [Melos](https://melos.invertase.dev/)
+- KMP / CMP: [Koin for Kotlin Multiplatform](https://insert-koin.io/docs/reference/koin-mp/kmp/), [Koin releases](https://insert-koin.io/docs/support/releases/) (4.2, compiler plugin 1.2), [Verifying your Koin configuration](https://insert-koin.io/docs/reference/koin-test/verify/), [kotlin-inject](https://github.com/evant/kotlin-inject), [Expected and actual declarations](https://kotlinlang.org/docs/multiplatform/multiplatform-expect-actual.html), [Project configuration](https://kotlinlang.org/docs/multiplatform/multiplatform-project-configuration.html)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 16 (modular architecture and dependency injection)

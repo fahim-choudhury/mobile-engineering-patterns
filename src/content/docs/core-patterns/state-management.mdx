@@ -1,0 +1,353 @@
+---
+title: State management and unidirectional data flow
+description: How each stack keeps one source of truth for what the screen shows, with ViewModels, Observable models, reducers, stores and notifiers, and how state flows down while events flow up.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A shopping app ships a cart, and the first week brings these bug reports:
+
+- The badge on the cart tab says 2. The cart screen lists 3 items.
+- A spinner and an error message are on screen at the same time.
+- A user double-taps "Place order" and is charged twice.
+- After rotating the phone, the "Added to cart" message appears again.
+
+Each bug is a state bug. The first has two copies of the same fact. The second allows a combination of values that should not exist. The third lets a second event in while the first is still being handled. The fourth stores a one-time event as if it were lasting state.
+
+<BrainPower>
+A screen keeps three booleans: `isLoading`, `hasError` and `hasData`. Three booleans allow eight combinations. How many of the eight should the screen ever show? The answer is in the "Make impossible states unrepresentable" section.
+</BrainPower>
+
+## Constraints on a phone
+
+[Rendering models and declarative UI](/foundations/declarative-ui/) covered the rule that the UI is a function of state. This chapter is about the state itself: who owns it, who may change it and how long it lives. A phone adds constraints a web page does not have.
+
+- **Several screens are alive at once.** The back stack keeps the product list in memory under the product detail, under the cart. All three show the cart count.
+- **Screens are destroyed and rebuilt.** Rotation, a theme change or process death rebuilds the UI, and the state has to survive or be restored ([app lifecycle](/foundations/app-lifecycle/)).
+- **Most changes are asynchronous.** A tap starts a request, and the result arrives after the user has tapped again or left ([concurrency](/foundations/concurrency/)).
+- **Events come from outside the UI.** A push notification, a sync job or a deep link changes data while a screen is showing it.
+
+## State has an owner and a lifetime
+
+Before picking a library, sort each piece of state by who needs it.
+
+```d2
+classes: {
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  box: { style: { font-size: 16 } }
+  a: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  b: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  c: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  d: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 3
+grid-columns: 4
+grid-gap: 12
+h1: "UI element state" { class: head }
+h2: "Screen state" { class: head }
+h3: "App state" { class: head }
+h4: "Server state" { class: head }
+e1: "Is the menu open?\nScroll position" { class: a }
+e2: "Form fields,\nloading, errors" { class: b }
+e3: "Signed-in user,\ncart, theme" { class: c }
+e4: "Products, orders,\nanything the\nbackend owns" { class: d }
+o1: "Owner: the\ncomponent" { class: box }
+o2: "Owner: a state\nholder per screen" { class: box }
+o3: "Owner: an app-wide\nstore or repository" { class: box }
+o4: "Owner: the server.\nThe app keeps\na cache" { class: box }
+```
+
+Most state bugs come from putting state in the wrong column. The cart badge bug is app state that two screens each kept as screen state. Server state is the column teams most often get wrong: a product list is a cached copy of data the server owns, so it needs freshness rules and refetching, which a plain store does not provide. [Networking and the data layer](/core-patterns/networking/) covers that cache.
+
+## The pattern
+
+1. **One source of truth.** Every fact has one owner. Everything else reads from it or derives from it.
+2. **State flows down.** The owner exposes immutable state. The UI reads it and renders.
+3. **Events flow up.** The UI reports what the user did (`AddTapped`, `QuantityChanged`). It does not change state itself.
+4. **The state holder decides.** A state holder (a ViewModel, a store, a notifier) takes an event, talks to the data layer and produces the next state.
+5. **Derive, don't duplicate.** The badge count is computed from the cart lines. It is never stored next to them.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ui: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  holder: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  data: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+screen: "UI\nrenders state,\nreports events" { class: ui }
+holder: "State holder\nevent + old state\n-> new state" { class: holder }
+repo: "Data layer\nrepositories" { class: data }
+screen -> holder: "events up" { style.font-size: 16 }
+holder -> screen: "state down" { style.font-size: 16 }
+holder -> repo: "calls" { style.font-size: 16 }
+repo -> holder: "data, as a stream" { style.font-size: 16 }
+```
+
+This loop is called unidirectional data flow (UDF). Android's architecture guide uses the name directly ([UI layer](https://developer.android.com/topic/architecture/ui-layer)), Redux made it popular on the web ([Redux style guide](https://redux.js.org/style-guide/)), and Flutter's architecture guide recommends the same shape under the name MVVM ([Flutter architecture guide](https://docs.flutter.dev/app-architecture/guide)).
+
+## A cart in each stack
+
+The same state holder in each stack: a cart with lines, a derived item count and one event, "add product".
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+data class CartUiState(
+    val lines: List<CartLine> = emptyList(),
+    val isPlacingOrder: Boolean = false,
+) {
+    val itemCount: Int get() = lines.sumOf { it.quantity }  // derived
+}
+
+class CartViewModel(private val orders: OrderRepository) : ViewModel() {
+    private val _state = MutableStateFlow(CartUiState())
+    val state: StateFlow<CartUiState> = _state.asStateFlow()
+
+    fun onAddTapped(product: Product) {
+        _state.update { it.copy(lines = it.lines + CartLine(product, 1)) }
+    }
+}
+
+@Composable
+fun CartScreen(viewModel: CartViewModel = viewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    CartContent(state, onAdd = viewModel::onAddTapped) // state down, events up
+}
+```
+A `ViewModel` outlives rotation and is scoped to a screen or a navigation entry. It exposes one immutable `UiState` through a `StateFlow`, and `update` applies each change atomically ([state holders and UI state](https://developer.android.com/topic/architecture/ui-layer/stateholders)). `CartContent` takes plain values and lambdas, which Compose calls state hoisting ([state hoisting](https://developer.android.com/develop/ui/compose/state-hoisting)). When the whole team routes every event through one `onEvent(event)` function and one reducer, the same code is called MVI.
+</TabItem>
+<TabItem label="iOS">
+```swift
+@MainActor @Observable
+final class CartModel {
+    private(set) var lines: [CartLine] = []
+    private(set) var isPlacingOrder = false
+
+    var itemCount: Int { lines.reduce(0) { $0 + $1.quantity } }  // derived
+
+    func addTapped(_ product: Product) {
+        lines.append(CartLine(product: product, quantity: 1))
+    }
+}
+
+struct CartScreen: View {
+    @State private var model = CartModel()   // the view owns the model
+
+    var body: some View {
+        CartContent(lines: model.lines, onAdd: model.addTapped)
+            .badge(model.itemCount)
+    }
+}
+```
+`@Observable` (iOS 17+) tracks which properties a view's `body` reads and re-runs only the views that read a changed property ([Observation](https://developer.apple.com/documentation/observation), [managing model data](https://developer.apple.com/documentation/swiftui/managing-model-data-in-your-app)). `private(set)` is what makes the flow one-way: views can read `lines` and can only change it through a method. `@State` holds local view state and owned models, `@Binding` and `@Bindable` pass write access down, and `@Environment` shares a model with a whole subtree. Older code uses `ObservableObject` with `@Published`. Teams that want one reducer for every event use [The Composable Architecture](https://github.com/pointfreeco/swift-composable-architecture), a third-party library.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import { create } from 'zustand';
+
+type CartStore = {
+  lines: CartLine[];
+  addTapped: (product: Product) => void;
+};
+
+// App state: one store, used by any screen.
+export const useCart = create<CartStore>()((set) => ({
+  lines: [],
+  addTapped: (product) =>
+    set((s) => ({ lines: [...s.lines, { product, quantity: 1 }] })),
+}));
+
+// Derived, and the badge re-renders only when the count changes.
+export const useItemCount = () =>
+  useCart((s) => s.lines.reduce((n, l) => n + l.quantity, 0));
+
+function CartBadge() {
+  const count = useItemCount();
+  return <Badge>{count}</Badge>;
+}
+```
+React splits the job across several tools. `useState` and `useReducer` hold element and screen state ([extracting state logic into a reducer](https://react.dev/learn/extracting-state-logic-into-a-reducer)). App state goes in a store outside the component tree: the sample uses Zustand 5 ([docs](https://zustand.docs.pmnd.rs/)), and large teams often pick Redux Toolkit for its strict conventions ([Redux Toolkit](https://redux-toolkit.js.org/)). Server state goes in TanStack Query, which is a cache with refetching, not a store ([TanStack Query](https://tanstack.com/query/latest/docs/framework/react/overview)). React Context passes a value down the tree without props, but every consumer re-renders when the value changes, so it suits values that rarely change, such as the theme.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+@immutable
+class CartState {
+  const CartState({this.lines = const [], this.isPlacingOrder = false});
+  final List<CartLine> lines;
+  final bool isPlacingOrder;
+
+  int get itemCount => lines.fold(0, (n, l) => n + l.quantity); // derived
+}
+
+class CartNotifier extends Notifier<CartState> {
+  @override
+  CartState build() => const CartState();
+
+  void addTapped(Product product) {
+    state = CartState(lines: [...state.lines, CartLine(product, 1)]);
+  }
+}
+
+final cartProvider = NotifierProvider<CartNotifier, CartState>(CartNotifier.new);
+
+class CartBadge extends ConsumerWidget {
+  const CartBadge({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Rebuilds only when the count changes.
+    final count = ref.watch(cartProvider.select((s) => s.itemCount));
+    return Badge(label: Text('$count'));
+  }
+}
+```
+The sample uses Riverpod 3 ([docs](https://riverpod.dev/)): providers live outside the widget tree, and `ref.watch` subscribes a widget to one. Flutter's own guide builds ViewModels on `ChangeNotifier` and `ListenableBuilder` from the SDK, with no package ([state management case study](https://docs.flutter.dev/app-architecture/case-study/ui-layer)). The `flutter_bloc` package (9.x) is the strict option: a `Bloc` receives event objects and emits states, and a `Cubit` is the lighter form with methods instead of events ([bloc concepts](https://bloclibrary.dev/bloc-concepts/)). `setState` in a `StatefulWidget` stays the tool for element state.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: the Android ViewModel, unchanged.
+class CartViewModel(private val orders: OrderRepository) : ViewModel() {
+    private val _state = MutableStateFlow(CartUiState())
+    val state: StateFlow<CartUiState> = _state.asStateFlow()
+
+    fun onAddTapped(product: Product) {
+        _state.update { it.copy(lines = it.lines + CartLine(product, 1)) }
+    }
+}
+
+// commonMain, Compose Multiplatform UI
+@Composable
+fun CartScreen(viewModel: CartViewModel = viewModel { CartViewModel(orders) }) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    CartContent(state, onAdd = viewModel::onAddTapped)
+}
+```
+The Jetpack `ViewModel` and `StateFlow` are multiplatform, so the Android code moves to `commonMain` as it is. On non-JVM targets, `viewModel()` needs an explicit factory lambda because there is no reflection to construct the class ([common ViewModel](https://kotlinlang.org/docs/multiplatform/compose-viewmodel.html)). With a SwiftUI front end, Swift has to observe the Kotlin `StateFlow`. That goes through SKIE, KMP-NativeCoroutines or Swift export, with the limits described in [concurrency](/foundations/concurrency/). Many teams wrap the shared ViewModel in a small `@Observable` Swift class so the views stay ordinary SwiftUI.
+</TabItem>
+</Tabs>
+
+## Make impossible states unrepresentable
+
+Answer to the Brain Power question: four. The screen is loading, showing data, showing an error, or empty. Three booleans allow eight combinations, and the spinner-plus-error bug is one of the four that should not exist.
+
+Model the state as one value that is exactly one of the valid cases, and the compiler rejects the rest.
+
+| Stack | Construct | Example |
+| --- | --- | --- |
+| Kotlin | `sealed interface` | `sealed interface OrdersState` with `data object Loading`, `data class Loaded(val orders: List<Order>)` and `data class Failed(val reason: String)` implementing it |
+| Swift | `enum` with associated values | `enum OrdersState { case loading, loaded([Order]), failed(String) }` |
+| TypeScript | Discriminated union | <code>type OrdersState = &#123; status: 'loading' &#125; &#124; &#123; status: 'loaded'; orders: Order[] &#125; &#124; &#123; status: 'failed'; reason: string &#125;</code> |
+| Dart | `sealed class` | `sealed class OrdersState {}` with `Loading`, `Loaded` and `Failed` subclasses |
+
+All four languages check that a `when` or `switch` over the type handles every case. Adding a fifth case then produces a build error at each place that needs updating.
+
+The double-charge bug has the same fix. "Placing order" is a state. While the state holder is in it, a second `PlaceOrderTapped` event is ignored and the button renders disabled.
+
+```kotlin
+fun onPlaceOrderTapped() {
+    if (_state.value.isPlacingOrder) return          // already in flight
+    _state.update { it.copy(isPlacingOrder = true) }
+    viewModelScope.launch {
+        val result = orders.place(_state.value.lines)
+        _state.update { it.copy(isPlacingOrder = false, lastResult = result) }
+    }
+}
+```
+
+Disabling the button in the UI alone is not enough. Two taps can arrive in the same frame, before the UI has redrawn. The server also needs an idempotency key, covered in [networking](/core-patterns/networking/).
+
+## One-time events
+
+"Show a snackbar" and "navigate to the receipt" happen once. If they are stored in state with nothing clearing them, they replay whenever the UI is rebuilt, which is the rotation bug from the opening.
+
+There are two common designs.
+
+- **Event as state, acknowledged.** The state holds `userMessage: String?`. The UI shows it and calls `messageShown()`, and the holder sets it back to `null`. Nothing is lost if the UI is in the background when the event happens. Android's guidance recommends this design ([UI events](https://developer.android.com/topic/architecture/ui-layer/events)).
+- **A separate event stream.** The holder exposes a stream of effects next to the state (a `Channel` in Kotlin, an `AsyncStream` in Swift, a `BlocListener` in Flutter). The code is shorter. An event sent while nobody is collecting can be dropped unless the stream buffers it.
+
+<Aside type="caution" title="Watch it!">
+Don't let the UI navigate "when `isLoggedIn` becomes true" without consuming the fact. A rebuilt screen sees `true` again and navigates a second time. Either clear the flag after navigating, or make the navigation state itself the thing that changes ([navigation](/core-patterns/navigation/)).
+</Aside>
+
+## Trade-offs and scale
+
+**Local first, lift when shared.** Keep state as close to its only user as possible. Lift it to a screen holder when a sibling needs it, and to app scope when several screens need it. A global store that holds whether one dropdown is open makes every change harder to trace.
+
+**Methods or a single reducer.** A ViewModel with methods (MVVM) is the least code. A single `reduce(state, event)` function (MVI, Redux, Bloc, TCA) costs an event type and more ceremony per feature. In return, every change passes one place, so you can log every event, replay a bug report and test the reducer as a pure function. Teams with many engineers on one feature tend to accept that cost for the consistency.
+
+**Coarse state causes wide updates.** One big state object is easy to reason about. Whether a change to one field redraws everything depends on the stack: Compose skips composables whose inputs are equal, SwiftUI's `@Observable` tracks per property, and React and Riverpod need selectors as in the samples above ([declarative UI](/foundations/declarative-ui/)).
+
+**Test the holder without the UI.** A state holder that takes its dependencies through its constructor can be tested by sending events and asserting on states, with no emulator ([dependency injection](/core-patterns/dependency-injection/)).
+
+**Decide what survives process death.** A ViewModel or a store lives in memory. The draft the user typed needs `SavedStateHandle`, `@SceneStorage` or disk, as [app lifecycle](/foundations/app-lifecycle/) describes. Persisting a whole store on every change is the common overcorrection, and it turns every state shape change into a migration.
+
+<NoDumbQuestions>
+<dt>Is MVI a different architecture from MVVM?</dt>
+<dd>It is the same loop with a stricter rule. In MVVM the UI calls methods on the state holder. In MVI it sends event objects to one entry point, and one function computes the next state. The data flow has the same direction in both.</dd>
+
+<dt>Do I need Redux in a React Native app?</dt>
+<dd>Not by default. Once server data moves into a query cache, the remaining app state is often small enough for a few Zustand stores or `useReducer` with context. Redux Toolkit earns its place when you want its DevTools, middleware and enforced conventions across a large team.</dd>
+
+<dt>Is two-way binding a violation of unidirectional flow?</dt>
+<dd>A text field bound with `$text` in SwiftUI or a controlled `TextInput` in React is a shorthand for "state down, change event up" on one property. It stays one-way as long as the bound property has one owner.</dd>
+
+<dt>Should every screen have a ViewModel?</dt>
+<dd>A screen with logic, loading or data from a repository should have a state holder. A static screen or a small dialog does fine with local state.</dd>
+
+<dt>Does the React Compiler change any of this?</dt>
+<dd>It changes how much you memoize by hand, and it leaves ownership alone. React Compiler 1.0 memoizes components and hooks at build time (<a href="https://react.dev/blog/2025/10/07/react-compiler-1">release post</a>). Which component or store owns a piece of state is still your decision.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Element state | `remember { mutableStateOf() }` | `@State` | `useState` | `StatefulWidget` + `setState` | `remember { mutableStateOf() }` |
+| Screen state holder | `ViewModel` | `@Observable` class | `useReducer`, custom hook | `ChangeNotifier`, `Notifier`, `Cubit` | `ViewModel` in `commonMain` |
+| Observable state | `StateFlow` | Observed properties | Store, hook state | `ValueNotifier`, provider, `Stream` | `StateFlow` |
+| UI subscribes with | `collectAsStateWithLifecycle()` | Reading a property in `body` | Hook call with a selector | `ref.watch`, `ListenableBuilder`, `BlocBuilder` | `collectAsStateWithLifecycle()` |
+| Pass write access down | Lambda parameters | `@Binding`, `@Bindable` | Callback props | Callback parameters | Lambda parameters |
+| Share with a subtree | `CompositionLocal` | `@Environment` | Context | `InheritedWidget`, `Provider` | `CompositionLocal` |
+| App-wide state | Repository or singleton holder | App-level `@Observable` in the environment | Zustand, Redux Toolkit | Riverpod provider, top-level Bloc | Repository in shared code |
+| Server state cache | Repository exposing `Flow` | Repository, SwiftData `@Query` | TanStack Query | Riverpod `AsyncNotifier`, repository | Repository exposing `Flow` |
+| One-of-many state type | `sealed interface` | `enum` with associated values | Discriminated union | `sealed class` | `sealed interface` |
+| Strict reducer option | MVI libraries (Orbit, Mavericks) | The Composable Architecture | Redux Toolkit | `flutter_bloc` | MVIKotlin, Orbit |
+
+<Exercise>
+For each piece of state in a food delivery app, name the column from "State has an owner and a lifetime" (element, screen, app or server) and where you would keep it.
+
+1. Whether the "sort by" dropdown is open.
+2. The text typed into the delivery address form.
+3. The list of restaurants near the user.
+4. The items in the basket, shown on the restaurant screen, the basket screen and the tab bar.
+5. The courier's live position on the order tracking map.
+
+<Fragment slot="answer">
+1. Element state. Local to the dropdown component (`remember`, `@State`, `useState`, `setState`).
+2. Screen state, in the screen's state holder. It should also survive process death, so it goes into saved state or a draft on disk.
+3. Server state. A repository or query cache owns the cached copy, with a rule for when it is stale. The screen state holds only the current filter.
+4. App state. One owner (a basket repository or store) that all three screens observe. The badge count is derived from the lines.
+5. Server state that arrives as a stream. The repository exposes it as a `Flow`, an `AsyncSequence` or a `Stream`, and the screen holder maps it into UI state. Nothing needs to be saved across process death, because the next message replaces it.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** uses MVVM with data binding. The MVVM Toolkit generates `INotifyPropertyChanged` code from `[ObservableProperty]` attributes.
+- **Ionic / Capacitor** apps use the state tools of their web framework: signals in Angular, stores in React or Vue.
+- **Lynx** renders with ReactLynx, so React hooks and external stores apply, with the app's logic on the background thread.
+
+## Sources
+
+- Android: [UI layer](https://developer.android.com/topic/architecture/ui-layer), [State holders and UI state](https://developer.android.com/topic/architecture/ui-layer/stateholders), [UI events](https://developer.android.com/topic/architecture/ui-layer/events), [State hoisting](https://developer.android.com/develop/ui/compose/state-hoisting), [Lifecycle releases](https://developer.android.com/jetpack/androidx/releases/lifecycle)
+- iOS: [Observation](https://developer.apple.com/documentation/observation), [Managing model data in your app](https://developer.apple.com/documentation/swiftui/managing-model-data-in-your-app), [Migrating from the Observable Object protocol to the Observable macro](https://developer.apple.com/documentation/swiftui/migrating-from-the-observable-object-protocol-to-the-observable-macro), [The Composable Architecture](https://github.com/pointfreeco/swift-composable-architecture)
+- React Native: [Managing state](https://react.dev/learn/managing-state), [Extracting state logic into a reducer](https://react.dev/learn/extracting-state-logic-into-a-reducer), [Zustand](https://zustand.docs.pmnd.rs/) (5.x), [Redux style guide](https://redux.js.org/style-guide/), [Redux Toolkit](https://redux-toolkit.js.org/), [TanStack Query](https://tanstack.com/query/latest/docs/framework/react/overview) (5.x), [React Compiler v1.0](https://react.dev/blog/2025/10/07/react-compiler-1)
+- Flutter: [Architecture guide](https://docs.flutter.dev/app-architecture/guide), [UI layer case study](https://docs.flutter.dev/app-architecture/case-study/ui-layer), [State management options](https://docs.flutter.dev/data-and-backend/state-mgmt/options), [Riverpod](https://riverpod.dev/) (3.x), [What's new in Riverpod 3.0](https://riverpod.dev/docs/whats_new), [Bloc concepts](https://bloclibrary.dev/bloc-concepts/) (flutter_bloc 9.x)
+- KMP / CMP: [Common ViewModel](https://kotlinlang.org/docs/multiplatform/compose-viewmodel.html), [Compose Multiplatform 1.12.0 release](https://github.com/JetBrains/compose-multiplatform/releases/tag/v1.12.0) (Lifecycle 2.11.0), [SKIE](https://skie.touchlab.co/)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 1 (state management) and ch. 14 (application state and event-driven changes)

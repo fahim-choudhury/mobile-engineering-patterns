@@ -1,0 +1,383 @@
+---
+title: Networking and the data layer
+description: How each stack talks to a backend over an unreliable network, with OkHttp and Retrofit, URLSession, fetch and TanStack Query, dio and Ktor, and how repositories keep the rest of the app away from HTTP.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+An app that worked on office Wi-Fi goes to production. The bug reports:
+
+- On a train, the order list shows a spinner for two minutes and then nothing.
+- The backend adds a new order status, `"partially_refunded"`. Every app version released before that day crashes when it opens the order list.
+- A user returns after a week away. The home screen fires five requests, the access token has expired, and the user is signed out.
+- A payment request times out, the app retries, and the user is charged twice.
+
+None of these appear with a fast connection and a backend that matches the app. All of them are normal conditions on a phone.
+
+<BrainPower>
+A `POST /payments` request times out after 30 seconds with no response. Did the payment happen? What would the app need to send so that retrying is safe either way?
+</BrainPower>
+
+## Constraints on a phone
+
+- **The network drops, stalls and changes.** A phone moves between Wi-Fi and cellular, through tunnels and lifts. A request can fail before it leaves, while it is in flight, or after the server has processed it.
+- **The app can stop mid-request.** The user switches apps and the OS suspends or kills the process ([app lifecycle](/foundations/app-lifecycle/)).
+- **Old versions never go away.** A web page is replaced on the next load. An app version you shipped two years ago is still installed somewhere and still calling your API, and you cannot patch it.
+- **The radio costs battery.** Each burst of traffic wakes the radio, and it stays in a high-power state for a while afterwards. Many small requests cost more than one batched request ([optimize network access](https://developer.android.com/develop/connectivity/network-ops/network-access-optimization)).
+- **Data can be metered.** Users pay for megabytes, and the OS exposes Data Saver and Low Data Mode so apps can hold back.
+
+## The pattern
+
+Keep HTTP in one place. The rest of the app asks a repository for domain objects and does not know which URLs exist.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ui: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  data: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  net: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+holder: "State holder\nasks for orders" { class: ui }
+repo: "OrderRepository\nreturns domain models,\ndecides remote or local" { class: data }
+remote: "Remote data source\nAPI client, DTOs" { class: net }
+local: "Local data source\ndatabase, cache" { class: box }
+server: "Backend" { class: box }
+holder -> repo
+repo -> remote
+repo -> local
+remote -> server: "HTTPS" { style.font-size: 16 }
+```
+
+1. **A repository per kind of data.** It exposes `orders()` and `placeOrder()`, hides the sources behind it and is the only owner of that data ([state management](/core-patterns/state-management/)). Android's guide ([data layer](https://developer.android.com/topic/architecture/data-layer)) and Flutter's guide ([data layer case study](https://docs.flutter.dev/app-architecture/case-study/data-layer)) both prescribe this shape.
+2. **DTOs at the edge, domain models inside.** A data transfer object (DTO) mirrors the JSON. The repository maps it to the model the app uses. When the backend renames a field, one mapper changes.
+3. **One configured client.** Base URL, timeouts, headers, authentication, logging and retry policy are set once on a shared HTTP client. Requests pass through a chain of interceptors.
+4. **Decode tolerantly.** Ignore unknown fields. Map unknown enum values to an `unknown` case. An older app must survive a newer backend.
+5. **Errors are values.** A repository returns a result that separates "no connection", "server said no" and "response did not parse", so the UI can offer the right action for each.
+6. **Retry only what is safe.** Retrying a `GET` is harmless. Retrying a `POST` needs an idempotency key so the server can recognise the repeat.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  step: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 1
+grid-gap: 10
+call: "Repository\ncall" { class: box }
+i1: "Add\nheaders" { class: step }
+i2: "Auth token,\nrefresh\non 401" { class: step }
+i3: "Retry,\nbackoff" { class: step }
+i4: "Log and\nmeasure" { class: step }
+wire: "Network" { class: box }
+call -> i1 -> i2 -> i3 -> i4 -> wire
+```
+
+## A configured client in each stack
+
+The same job in each stack: fetch an order list as typed models, with a timeout, tolerant decoding and an auth header.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Serializable
+data class OrderDto(val id: Long, val status: String, val totalCents: Long)
+
+interface OrderApi {
+    @GET("orders")
+    suspend fun orders(): List<OrderDto>
+}
+
+val json = Json { ignoreUnknownKeys = true }   // tolerate new fields
+
+val client = OkHttpClient.Builder()
+    .callTimeout(20, TimeUnit.SECONDS)
+    .addInterceptor { chain ->
+        chain.proceed(
+            chain.request().newBuilder()
+                .header("Authorization", "Bearer ${tokens.access}")
+                .build()
+        )
+    }
+    .authenticator(TokenRefresher(tokens))     // called on a 401
+    .build()
+
+val api: OrderApi = Retrofit.Builder()
+    .baseUrl("https://api.shop.example/")
+    .client(client)
+    .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+    .build()
+    .create()
+```
+OkHttp (5.x) is the HTTP client: connection pooling, HTTP/2, a disk cache, interceptors and an `Authenticator` hook for 401 responses ([OkHttp](https://lysine.dev/okhttp/), [interceptors](https://lysine.dev/okhttp/features/interceptors/)). Retrofit (3.0) turns an annotated interface into calls on it, with `suspend` support and a kotlinx.serialization converter ([Retrofit declarations](https://lysine.dev/retrofit/declarations/)). Ktor Client is the other common choice and is shown in the KMP tab. Android blocks cleartext HTTP by default for apps targeting API 28 and later ([network security configuration](https://developer.android.com/privacy-and-security/security-config)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+struct OrderDTO: Decodable {
+    let id: Int
+    let status: String
+    let totalCents: Int
+}
+
+struct APIClient {
+    let baseURL = URL(string: "https://api.shop.example/")!
+    let tokens: TokenStore
+    let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.waitsForConnectivity = true   // wait for a network before failing
+        return URLSession(configuration: config)
+    }()
+
+    func get<T: Decodable>(_ path: String) async throws -> T {
+        var request = URLRequest(url: baseURL.appending(path: path))
+        request.setValue("Bearer \(await tokens.access)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.server(response)
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+}
+
+let orders: [OrderDTO] = try await client.get("orders")
+```
+`URLSession` is the system HTTP stack, and most apps wrap it in a small client type as above ([URLSession](https://developer.apple.com/documentation/foundation/urlsession)). It has no interceptor chain. Shared behaviour goes in the wrapper, or in a library such as [Alamofire](https://github.com/Alamofire/Alamofire), which adds request adapters and retriers. `Decodable` ignores JSON keys the type does not declare. A `String`-backed `enum` throws on an unknown value, so decode the raw string and map it yourself. `waitsForConnectivity` makes a request wait for a connection, up to `timeoutIntervalForResource`, where it would otherwise fail at once ([waitsForConnectivity](https://developer.apple.com/documentation/foundation/urlsessionconfiguration/waitsforconnectivity)). App Transport Security blocks cleartext HTTP by default ([preventing insecure network connections](https://developer.apple.com/documentation/security/preventing-insecure-network-connections)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import { z } from 'zod';
+import { useQuery } from '@tanstack/react-query';
+
+const Order = z.object({
+  id: z.number(),
+  status: z.string(),          // not z.enum: new values must not throw
+  totalCents: z.number(),
+});
+type Order = z.infer<typeof Order>;
+
+async function api<T>(path: string, schema: z.ZodType<T>): Promise<T> {
+  const res = await fetch(`https://api.shop.example/${path}`, {
+    headers: { Authorization: `Bearer ${tokens.access}` },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new ApiError(res.status);
+  return schema.parse(await res.json());   // validate at the edge
+}
+
+function useOrders() {
+  return useQuery({
+    queryKey: ['orders'],
+    queryFn: () => api('orders', z.array(Order)),
+    staleTime: 60_000,   // serve from cache for a minute
+  });
+}
+```
+`fetch` in React Native is implemented by the native networking stacks: `URLSession` on iOS and OkHttp on Android ([networking](https://reactnative.dev/docs/network)). TypeScript types are erased at runtime, so the response is validated with a schema library (zod here). TanStack Query (5.x) takes the role a repository has in the other stacks for server data: it caches by key, deduplicates identical requests in flight, retries failed queries three times with backoff by default and refetches stale data ([important defaults](https://tanstack.com/query/latest/docs/framework/react/guides/important-defaults)). On React Native you connect it to connectivity and app-focus events yourself ([React Native guide](https://tanstack.com/query/latest/docs/framework/react/react-native)). Shared headers and token refresh go in the `api` wrapper, or in an [axios](https://axios-http.com/docs/interceptors) instance with interceptors.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+@JsonSerializable()
+class OrderDto {
+  OrderDto({required this.id, required this.status, required this.totalCents});
+  final int id;
+  final String status;
+  final int totalCents;
+
+  factory OrderDto.fromJson(Map<String, dynamic> json) => _$OrderDtoFromJson(json);
+}
+
+final dio = Dio(BaseOptions(
+  baseUrl: 'https://api.shop.example/',
+  connectTimeout: const Duration(seconds: 10),
+  receiveTimeout: const Duration(seconds: 20),
+))
+  ..interceptors.add(InterceptorsWrapper(
+    onRequest: (options, handler) {
+      options.headers['Authorization'] = 'Bearer ${tokens.access}';
+      handler.next(options);
+    },
+  ));
+
+class OrderService {
+  Future<List<OrderDto>> orders() async {
+    final res = await dio.get<List<dynamic>>('orders');
+    return res.data!
+        .map((e) => OrderDto.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+}
+```
+Flutter does not use the platform HTTP stack by default. `dart:io`'s `HttpClient` opens its own sockets, and the `http` package (1.x, from the Dart team) and `dio` (5.x, with interceptors and cancellation) both sit on it ([networking](https://docs.flutter.dev/data-and-backend/networking), [dio](https://pub.dev/packages/dio)). To get the platform stack, with its HTTP/3 support, VPN and proxy handling, plug in `cupertino_http` and `cronet_http` ([using platform HTTP clients](https://dart.dev/tutorials/server/fetch-data#using-platform-specific-http-clients)). Dart has no reflection in Flutter builds, so JSON classes are written by hand or generated with `json_serializable` ([JSON and serialization](https://docs.flutter.dev/data-and-backend/serialization/json)). Generated `fromJson` ignores unknown keys. Flutter's architecture guide calls the API wrapper a service and puts repositories above it.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain
+@Serializable
+data class OrderDto(val id: Long, val status: String, val totalCents: Long)
+
+val client = HttpClient {
+    install(ContentNegotiation) {
+        json(Json { ignoreUnknownKeys = true })
+    }
+    install(HttpTimeout) { requestTimeoutMillis = 20_000 }
+    install(Auth) {
+        bearer {
+            loadTokens { tokens.load() }
+            refreshTokens { tokens.refresh(oldTokens) }   // runs once per expiry
+        }
+    }
+    defaultRequest { url("https://api.shop.example/") }
+}
+
+class OrderApi(private val client: HttpClient) {
+    suspend fun orders(): List<OrderDto> = client.get("orders").body()
+}
+```
+Ktor Client (3.6) is the multiplatform HTTP client. The API is common code, and an engine per platform does the I/O: OkHttp on Android and Darwin, which wraps `URLSession`, on iOS ([client engines](https://ktor.io/docs/client-engines.html)). Features are plugins: content negotiation with kotlinx.serialization, timeouts, retry and bearer authentication with token refresh ([bearer authentication](https://ktor.io/docs/client-bearer-auth.html), [retry](https://ktor.io/docs/client-request-retry.html)). The repository above it lives in `commonMain` too, so the whole data layer is shared, and Swift receives it as `suspend` functions and flows ([concurrency](/foundations/concurrency/)).
+</TabItem>
+</Tabs>
+
+## Failures you have to design for
+
+### Token refresh, once
+
+The signed-out user from the opening hit a race. Five requests got a 401, each tried to refresh, the first refresh invalidated the token the others were using, and the server rejected them all.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  wait: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 4
+grid-columns: 3
+grid-gap: 12
+h0: "Step" { class: head }
+h1: "Request A" { class: head }
+h2: "Requests B to E" { class: head }
+s1: "Token expired" { class: box }
+a1: "gets 401" { class: box }
+b1: "get 401" { class: box }
+s2: "Refresh" { class: box }
+a2: "takes the lock,\ncalls /token" { class: ok }
+b2: "wait on\nthe same lock" { class: wait }
+s3: "New token" { class: box }
+a3: "retries with\nthe new token" { class: ok }
+b3: "see the new token,\nretry without\nrefreshing" { class: ok }
+```
+
+The refresh has to be single-flight: one caller refreshes, the others wait and reuse the result. OkHttp's `Authenticator` plus a lock, a Swift `actor` that stores the in-flight refresh `Task`, a shared promise in JavaScript and Ktor's `bearer` plugin all implement the same idea. Only a failed refresh should sign the user out, and a refresh that failed because the network was down is a network error.
+
+### Retries and idempotency
+
+Answer to the Brain Power question: the app cannot know. The request may have been lost on the way out, or processed with the response lost on the way back. The fix is an idempotency key: the app generates a unique ID for the user's action (one per tap of "Pay", reused across retries) and sends it in a header. The server stores the outcome under that key and returns the stored outcome when it sees the key again. Stripe's API documents the pattern ([idempotent requests](https://docs.stripe.com/api/idempotent_requests)).
+
+Rules that hold in every stack:
+
+- Retry `GET`, `PUT` and `DELETE` automatically. Retry `POST` only with an idempotency key.
+- Retry connection failures, timeouts and 5xx responses. A 4xx response will fail the same way again.
+- Wait between attempts with exponential backoff and random jitter, and cap the count. When a backend recovers from an outage, thousands of apps retrying at the same instant take it down again.
+- Honour a `Retry-After` header on 429 and 503 responses.
+
+### Tolerant decoding and old versions
+
+The `"partially_refunded"` crash came from a strict enum. The backend made a change that looked additive, and the installed apps could not read it. Client rules: ignore unknown fields, map unknown enum values to an `unknown` case with a neutral presentation, and treat missing optional fields as absent. Server rules: add fields, never rename or remove them while app versions that read them are in use, and never change a field's type. The chapter on [old app versions](/shipping/old-versions/) covers versioning and forced upgrades.
+
+<Aside type="caution" title="Watch it!">
+`kotlinx.serialization` throws on unknown keys unless you set `ignoreUnknownKeys = true`, and throws on an unknown enum value unless you set `coerceInputValues = true` and give the property a default ([JSON configuration](https://kotlinlang.org/api/kotlinx.serialization/kotlinx-serialization-json/kotlinx.serialization.json/-json-builder/)). The defaults are the strict ones. Configure one `Json` instance for the app and write a test that decodes a payload with an extra field and an unknown enum value.
+</Aside>
+
+### Timeouts and connectivity
+
+The two-minute spinner came from default timeouts. `URLSession` waits 60 seconds per request by default, and OkHttp's defaults are 10 seconds each for connect, read and write with no overall limit ([OkHttpClient.Builder](https://lysine.dev/okhttp/5.x/okhttp/okhttp3/-ok-http-client/-builder/)). Set an overall deadline per call that matches what a user will wait for.
+
+Connectivity APIs (`ConnectivityManager`, `NWPathMonitor`, NetInfo, `connectivity_plus`) report whether a network interface is up. They cannot tell you the request will succeed: captive portals and dead Wi-Fi report "connected". Use them to show an offline banner and to trigger a refresh when the connection returns. Always attempt the request and handle its failure.
+
+## Trade-offs and scale
+
+**Generate the client from the API contract.** With an OpenAPI or GraphQL schema as the source, the DTOs and the client are generated for each platform, and a breaking backend change fails the app's build. GraphQL clients such as Apollo (Kotlin, iOS, React) also bring a normalized cache. The cost is a build step and generated code to review.
+
+**REST, GraphQL or gRPC.** REST over JSON is the default and the easiest to debug. GraphQL lets each screen ask for exactly its fields in one round trip, which suits slow networks and many screen variants. gRPC and Protobuf give compact binary payloads and strict schemas. Protobuf's rules for unknown fields solve tolerant decoding at the format level.
+
+**A backend for the mobile app.** When one screen needs six calls, latency on cellular multiplies. An endpoint shaped for the screen (a backend-for-frontend) moves that work to the data centre and lets you fix bugs without an app release.
+
+**Cancel what nobody is waiting for.** A request started by a screen should be cancelled when the screen closes ([concurrency](/foundations/concurrency/)). A request that writes user data should not be tied to the screen, and belongs to an app-scoped queue ([persistence and offline-first](/core-patterns/persistence/), [background work](/core-patterns/background-work/)).
+
+**Use the HTTP cache.** `Cache-Control` and `ETag` headers work on mobile as on the web. OkHttp and `URLSession` both implement an HTTP disk cache, and a `304 Not Modified` response costs a few bytes.
+
+**Test against a fake server.** Each stack can serve canned responses to the real client: OkHttp's `MockWebServer`, a custom `URLProtocol` on iOS, Mock Service Worker in React Native, `MockClient` in Dart's `http` and `MockEngine` in Ktor. Include the slow response, the 500, the malformed body and the payload with unknown fields.
+
+**Measure in production.** Record latency, error rate and payload size per endpoint, split by app version and network type. Office Wi-Fi tells you nothing about a 3G connection in a rural area.
+
+<NoDumbQuestions>
+<dt>Do I need a repository if TanStack Query or Riverpod already caches for me?</dt>
+<dd>You need the role, and the library can fill it. The point is that screens ask for "orders" and do not build URLs. A query hook per resource in one folder gives you that. A separate repository class earns its keep when data also comes from a database or a socket.</dd>
+
+<dt>Why map DTOs to domain models when the fields are the same?</dt>
+<dd>On day one they are the same. The mapper is where an unknown enum value becomes `unknown`, cents become a money type, and a renamed field gets absorbed. Without it, every one of those changes touches UI code.</dd>
+
+<dt>Should a repository throw exceptions or return a result type?</dt>
+<dd>Either works if the failure cases are typed. Swift's typed `throws`, Kotlin sealed results, discriminated unions in TypeScript and sealed classes in Dart all let the caller switch over "offline", "unauthorized" and "server error". Avoid a bare string message.</dd>
+
+<dt>Where does certificate pinning fit?</dt>
+<dd>In the client configuration, next to timeouts. It protects against a compromised certificate authority, and it can lock every user out if a pin expires before you ship an update. The [security chapter](/shipping/security-privacy/) covers when it is worth it.</dd>
+
+<dt>Is a WebSocket handled the same way?</dt>
+<dd>The repository still owns it and exposes a stream. The extra work is reconnection: the OS closes sockets when the app is suspended, so the client reconnects on foreground and fetches what it missed.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| HTTP client | OkHttp | `URLSession` | `fetch` (native stacks underneath) | `dart:io` `HttpClient` via `http` or `dio` | Ktor Client |
+| Typed API definition | Retrofit interface | Hand-written client, OpenAPI Generator | Typed wrapper, generated hooks | `retrofit` package, hand-written service | Hand-written, Ktorfit |
+| JSON to objects | kotlinx.serialization | `Codable` | `res.json()` + zod | `json_serializable` | kotlinx.serialization |
+| Interceptor | `Interceptor` | Wrapper, `URLProtocol` | Wrapper, axios interceptor | `Interceptor` (dio) | Client plugin |
+| Token refresh hook | `Authenticator` | Actor in the client | Shared promise in the wrapper | `QueuedInterceptor` | `Auth` plugin, `bearer` |
+| Timeout | `callTimeout` | `timeoutIntervalForRequest` | `AbortSignal.timeout` | `BaseOptions` timeouts | `HttpTimeout` plugin |
+| Cancel a request | Coroutine cancellation | Task cancellation | `AbortController` | `CancelToken` (dio) | Coroutine cancellation |
+| Server-state cache | Repository + database | Repository, `URLCache` | TanStack Query | Repository, Riverpod | Repository + database |
+| Connectivity signal | `ConnectivityManager` | `NWPathMonitor` | `@react-native-community/netinfo` | `connectivity_plus` | Per platform |
+| Fake server for tests | `MockWebServer` | `URLProtocol` stub | Mock Service Worker | `MockClient` | `MockEngine` |
+| Cleartext HTTP | Blocked by default | Blocked by ATS | Host platform's rule | Host platform's rule | Host platform's rule |
+
+<Exercise>
+For each request, say whether the client should retry automatically after a timeout, and what else it needs.
+
+1. `GET /orders` when the order list opens.
+2. `POST /orders` when the user taps "Place order".
+3. `PUT /profile/address` with the full new address.
+4. `POST /analytics/events` with a batch of 40 events.
+5. `GET /orders` that returned `401 Unauthorized`.
+
+<Fragment slot="answer">
+1. Yes. Reading is safe to repeat. Use backoff, cap the attempts and show cached data meanwhile if there is any.
+2. Only with an idempotency key generated when the user tapped, reused on every retry. Without it, a retry can create a second order.
+3. Yes. `PUT` with the full value is idempotent: applying it twice leaves the same address.
+4. Yes, if each event carries its own ID so the server can drop duplicates. This request should not be tied to a screen, and can wait for a batch window or Wi-Fi.
+5. Not as it is. Refresh the token once, through the single-flight path, then repeat the request with the new token. If the refresh itself returns 401, sign the user out.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** uses `HttpClient` with `DelegatingHandler`s as interceptors, `System.Text.Json` for decoding and Polly-based resilience handlers for retries.
+- **Ionic / Capacitor** uses `fetch` in the WebView, subject to CORS, or Capacitor's native HTTP plugin, which routes requests through the platform stack.
+- **Lynx** provides a `fetch` API on its background thread, implemented by the host platform's networking.
+
+## Sources
+
+- Android: [Data layer](https://developer.android.com/topic/architecture/data-layer), [Optimize network access](https://developer.android.com/develop/connectivity/network-ops/network-access-optimization), [Network security configuration](https://developer.android.com/privacy-and-security/security-config), [OkHttp](https://lysine.dev/okhttp/) (5.x), [OkHttp interceptors](https://lysine.dev/okhttp/features/interceptors/), [Retrofit](https://lysine.dev/retrofit/) (3.0), [kotlinx.serialization JsonBuilder](https://kotlinlang.org/api/kotlinx.serialization/kotlinx-serialization-json/kotlinx.serialization.json/-json-builder/)
+- iOS: [URLSession](https://developer.apple.com/documentation/foundation/urlsession), [waitsForConnectivity](https://developer.apple.com/documentation/foundation/urlsessionconfiguration/waitsforconnectivity), [Preventing insecure network connections](https://developer.apple.com/documentation/security/preventing-insecure-network-connections), [Encoding and decoding custom types](https://developer.apple.com/documentation/foundation/encoding-and-decoding-custom-types), [NWPathMonitor](https://developer.apple.com/documentation/network/nwpathmonitor)
+- React Native: [Networking](https://reactnative.dev/docs/network), [TanStack Query important defaults](https://tanstack.com/query/latest/docs/framework/react/guides/important-defaults) (5.x), [TanStack Query on React Native](https://tanstack.com/query/latest/docs/framework/react/react-native), [zod](https://zod.dev/)
+- Flutter: [Networking](https://docs.flutter.dev/data-and-backend/networking), [JSON and serialization](https://docs.flutter.dev/data-and-backend/serialization/json), [Data layer case study](https://docs.flutter.dev/app-architecture/case-study/data-layer), [http](https://pub.dev/packages/http) (1.x), [dio](https://pub.dev/packages/dio) (5.x), [Platform HTTP clients](https://dart.dev/tutorials/server/fetch-data#using-platform-specific-http-clients)
+- KMP / CMP: [Ktor releases](https://ktor.io/docs/releases.html) (3.6), [Client engines](https://ktor.io/docs/client-engines.html), [Bearer authentication](https://ktor.io/docs/client-bearer-auth.html), [Request retry](https://ktor.io/docs/client-request-retry.html)
+- General: [Stripe: idempotent requests](https://docs.stripe.com/api/idempotent_requests), [AWS Architecture Blog: exponential backoff and jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 3 (the long tail of old app versions)

@@ -1,0 +1,438 @@
+---
+title: Localization and accessibility
+description: How each stack adapts an app to the user's language, region, text size and assistive technology, with string resources, String Catalogs, ICU messages and the semantics tree that screen readers use.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A shop app built in English launches in Germany, Poland and Saudi Arabia. The bug reports:
+
+- The German "Add to cart" button reads "In den Einkaufsw...".
+- The Polish cart says "5 produkty". The correct form is "5 produktów".
+- A delivery date shows as 03/04/2026, and customers in different countries read it as different days.
+- In Arabic, the text is right-aligned but the back arrow and the progress bar still run left to right.
+- A VoiceOver user hears "button, button, image, button" on the product screen.
+- A user with large text enabled cannot see the price, which is cut off.
+
+The first four are localization bugs and the last two are accessibility bugs. They share a cause: the app was built for one user, with one language, one text size and working eyesight. This chapter treats both as the same job of adapting to settings the user chose at the OS level.
+
+<BrainPower>
+English has two plural forms: "1 item" and "2 items". How many forms does a string need to be correct in Polish? In Arabic? In Japanese?
+</BrainPower>
+
+## Constraints on a phone
+
+- **Preferences are set once, in the OS.** Language, region, calendar, text size, bold text, reduced motion, contrast and screen reader are system settings. Users expect every app to follow them without a settings screen of its own.
+- **Strings ship inside the binary.** A typo in a translation needs a store release to fix, unless the app downloads strings over the air.
+- **Screens are small.** A string that grows by a third in German, on top of a font scaled to 200%, has little room to go.
+- **The combinations multiply.** Thirty languages, two text directions, several font scales and a screen reader cannot be covered by manual testing on every release.
+- **Accessibility is a legal requirement in many markets.** The European Accessibility Act has applied since 28 June 2025 to consumer e-commerce, banking, transport and e-book services in the EU, including their mobile apps ([Directive (EU) 2019/882](https://eur-lex.europa.eu/eli/dir/2019/882/oj), [AccessibleEU summary](https://accessible-eu-centre.ec.europa.eu/content-corner/news/eaa-comes-effect-june-2025-are-you-ready-2025-01-31_en)).
+
+## Localization: the pattern
+
+1. **No user-facing text in code.** Code refers to a key or a source string. A file per locale holds the translations, and the framework picks the file that matches the user's settings at runtime.
+2. **Whole messages with placeholders.** "Hello, %s" is one string with a slot. Concatenating `"Hello, " + name` fixes the word order to English.
+3. **Plurals and genders are rules.** The message format selects a variant from a number according to the language's rules.
+4. **Formatters produce dates, numbers and currency.** The platform formatter knows that 1,234.5 is written 1.234,5 in Germany and that the week starts on a different day.
+5. **Layout uses start and end.** In right-to-left languages, start is the right edge. Layouts written with start and end mirror themselves.
+6. **Layout leaves room.** Text wraps or the container grows. Nothing has a fixed width sized to the English string.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  code: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  file: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  run: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+keys: "Code refers to a key\ncart_items(count)" { class: code }
+srcfile: "Source strings (English)\nwith comments for translators" { class: file }
+tms: "Translation system\nor translators" { class: box }
+locales: "One file per locale\nde, pl, ar, ..." { class: file }
+runtime: "Runtime lookup:\nuser's locale -> file -> plural rule" { class: run }
+screen: "\"5 produktów\"" { class: box }
+keys -> srcfile: "extract" { style.font-size: 16 }
+srcfile -> tms: "export" { style.font-size: 16 }
+tms -> locales: "import" { style.font-size: 16 }
+locales -> runtime: "bundled in the app" { style.font-size: 16 }
+runtime -> screen
+```
+
+Answer to the Brain Power question: Polish needs four forms (one, few, many, other), Arabic needs six, and Japanese needs one. The Unicode CLDR project defines the categories `zero`, `one`, `two`, `few`, `many` and `other` and which numbers map to each in every language ([CLDR plural rules](https://cldr.unicode.org/index/cldr-spec/plural-rules)). Every stack below uses those categories, so `if (count == 1)` in code is always wrong.
+
+## A plural string in each stack
+
+The same job in each stack: show "1 item" or "5 items" in the cart, correct in every language.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```xml
+<!-- res/values/strings.xml -->
+<plurals name="cart_items">
+    <item quantity="one">%d item</item>
+    <item quantity="other">%d items</item>
+</plurals>
+
+<!-- res/values-pl/strings.xml -->
+<plurals name="cart_items">
+    <item quantity="one">%d produkt</item>
+    <item quantity="few">%d produkty</item>
+    <item quantity="many">%d produktów</item>
+    <item quantity="other">%d produktu</item>
+</plurals>
+```
+```kotlin
+Text(pluralStringResource(R.plurals.cart_items, count, count))
+```
+Android picks the `values-<locale>` directory that best matches the user's language list, and `R.plurals` and `R.string` are checked at compile time ([localize your app](https://developer.android.com/guide/topics/resources/localization), [quantity strings](https://developer.android.com/guide/topics/resources/string-resource#Plurals)). Since Android 13, users can set a language per app in system settings. The app declares its languages, which the Android Gradle plugin can generate with `generateLocaleConfig` ([per-app language preferences](https://developer.android.com/guide/topics/resources/app-languages)). Layouts mirror for right-to-left when they use `start` and `end`, which Compose does by default ([support different languages and cultures](https://developer.android.com/training/basics/supporting-devices/languages)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+// The string literal is the key. Xcode extracts it into Localizable.xcstrings.
+Text("\(count) items")
+
+// Outside SwiftUI:
+let label = String(localized: "\(count) items")
+
+// Dates, numbers and currency follow the user's region.
+Text(order.date, format: .dateTime.day().month().year())
+Text(price, format: .currency(code: "EUR"))
+```
+A String Catalog (`.xcstrings`, Xcode 15+) is one file that holds every string in every language. Xcode fills it from the code on each build, and the catalog editor adds plural variants per language with the CLDR categories ([localizing and varying text with a string catalog](https://developer.apple.com/documentation/xcode/localizing-and-varying-text-with-a-string-catalog)). Since Xcode 26, a catalog can also generate Swift symbols, so `Text(.cartItems(count))` fails to compile if the key is missing ([WWDC25: Explore localization with Xcode](https://developer.apple.com/videos/play/wwdc2025/225/)). Older projects have `.strings` and `.stringsdict` files, which Xcode can migrate. Users can set a language per app in Settings once the app has more than one localization. SwiftUI mirrors layouts for right-to-left languages by using leading and trailing edges.
+</TabItem>
+<TabItem label="React Native">
+```json
+// locales/en.json
+{ "cart_items_one": "{{count}} item", "cart_items_other": "{{count}} items" }
+
+// locales/pl.json
+{
+  "cart_items_one": "{{count}} produkt",
+  "cart_items_few": "{{count}} produkty",
+  "cart_items_many": "{{count}} produktów",
+  "cart_items_other": "{{count}} produktu"
+}
+```
+```tsx
+import i18n from 'i18next';
+import { initReactI18next, useTranslation } from 'react-i18next';
+import { getLocales } from 'expo-localization';
+
+i18n.use(initReactI18next).init({
+  resources: { en: { translation: en }, pl: { translation: pl } },
+  lng: getLocales()[0].languageCode ?? 'en',
+  fallbackLng: 'en',
+});
+
+function CartSummary({ count }: { count: number }) {
+  const { t } = useTranslation();
+  return <Text>{t('cart_items', { count })}</Text>;
+}
+```
+React Native has no built-in string system. `expo-localization` reads the user's locales from the OS ([Localization](https://docs.expo.dev/versions/latest/sdk/localization/), [Expo localization guide](https://docs.expo.dev/guides/localization/)), and a JavaScript library does the lookup: i18next with react-i18next in this sample ([i18next plurals](https://www.i18next.com/translation-function/plurals)). i18next picks the plural suffix through the JavaScript `Intl.PluralRules` API, and dates and numbers go through `Intl.DateTimeFormat` and `Intl.NumberFormat`, which Hermes provides. Keys are plain strings unless you add i18next's TypeScript typing. Strings that the OS shows before JavaScript runs, such as the app name and permission prompts, are localized in the native projects through the Expo app config. Right-to-left layout uses `start` and `end` style properties and `I18nManager` ([I18nManager](https://reactnative.dev/docs/i18nmanager)).
+</TabItem>
+<TabItem label="Flutter">
+```json
+// lib/l10n/app_en.arb
+{
+  "cartItems": "{count, plural, =1{1 item} other{{count} items}}",
+  "@cartItems": {
+    "description": "Number of items in the cart",
+    "placeholders": { "count": { "type": "int" } }
+  }
+}
+
+// lib/l10n/app_pl.arb
+{
+  "cartItems": "{count, plural, one{{count} produkt} few{{count} produkty} many{{count} produktów} other{{count} produktu}}"
+}
+```
+```dart
+MaterialApp(
+  localizationsDelegates: AppLocalizations.localizationsDelegates,
+  supportedLocales: AppLocalizations.supportedLocales,
+  home: const CartScreen(),
+);
+
+// In a widget: a generated, typed method.
+Text(AppLocalizations.of(context)!.cartItems(count));
+```
+Flutter's tool generates the `AppLocalizations` class from ARB files, one per locale, with ICU message syntax for plurals and selects ([internationalizing Flutter apps](https://docs.flutter.dev/ui/internationalization)). A missing key or a wrong argument type is a compile error. The generated files are written into your source tree. The older synthetic `package:flutter_gen` import has been removed, and tutorials that use it no longer build ([flutter_gen deprecation](https://docs.flutter.dev/release/breaking-changes/flutter-generate-i10n-source)). Dates and numbers use the `intl` package. `Directionality` flips layouts when widgets use `EdgeInsetsDirectional` and `AlignmentDirectional` in place of left and right.
+</TabItem>
+<TabItem label="KMP / CMP">
+```xml
+<!-- composeApp/src/commonMain/composeResources/values/strings.xml -->
+<resources>
+    <plurals name="cart_items">
+        <item quantity="one">%1$d item</item>
+        <item quantity="other">%1$d items</item>
+    </plurals>
+</resources>
+```
+```kotlin
+// commonMain
+Text(pluralStringResource(Res.plurals.cart_items, count, count))
+```
+Compose Multiplatform has its own resource system modelled on Android's: XML string files under `composeResources/values-<locale>`, and a generated `Res` object with typed accessors that work on every target ([resources setup](https://kotlinlang.org/docs/multiplatform/compose-multiplatform-resources-setup.html), [localization](https://kotlinlang.org/docs/multiplatform/compose-localize-strings.html)). Right-to-left support follows the system locale ([RTL languages](https://kotlinlang.org/docs/multiplatform/compose-rtl.html)). With shared logic under native UI, each platform keeps its own string files, and the shared code returns keys or typed values in place of display text. The third-party [moko-resources](https://github.com/icerockdev/moko-resources) library generates both platforms' resources from one source. Date and number formatting goes through `kotlinx-datetime` and platform formatters behind `expect`/`actual`.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Language and region are separate settings. A user can run the phone in English with the region set to Germany, and expects English text with German date and number formats. Take the language from the string lookup and pass the full locale to formatters. Never format a date with a hand-written pattern such as `MM/dd/yyyy`.
+</Aside>
+
+## Accessibility: the pattern
+
+A screen reader does not look at pixels. It reads a second tree that the UI framework builds next to the visual one: the semantics tree, also called the accessibility tree. Each node says what an element is, what it is called and what state it is in. TalkBack on Android and VoiceOver on iOS walk that tree, and so do Switch Access, Voice Control and UI test frameworks.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ui: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  sem: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 4
+grid-columns: 3
+grid-gap: 12
+h1: "On screen" { class: head }
+h2: "Semantics node,\nunlabelled" { class: head }
+h3: "Semantics node,\nlabelled" { class: head }
+a1: "Heart icon" { class: ui }
+a2: "\"Button\"" { class: bad }
+a3: "\"Add to favourites,\nbutton\"" { class: sem }
+b1: "Photo, name, price\nin one tappable card" { class: ui }
+b2: "\"Image\" \"Trail shoe\"\n\"89 euros\" (three stops)" { class: bad }
+b3: "\"Trail shoe, 89 euros,\nbutton\" (one stop)" { class: sem }
+c1: "Checkbox drawn\nfrom shapes" { class: ui }
+c2: "Nothing" { class: bad }
+c3: "\"Gift wrap, checkbox,\nnot checked\"" { class: sem }
+```
+
+1. **Every control has a role, a label and a state.** Standard components supply the role and state. You supply the label when the control has no text, as with an icon button.
+2. **Group what belongs together.** A card with a photo, a name and a price is one stop for the screen reader, with one combined description.
+3. **Hide decoration.** Images that add no information are removed from the tree.
+4. **Text scales with the user's setting.** Sizes use scalable units, and layouts reflow when the text doubles.
+5. **Targets are big enough.** At least 48 x 48 dp on Android and 44 x 44 pt on iOS ([Compose accessibility defaults](https://developer.android.com/develop/ui/compose/accessibility/api-defaults), [Apple Human Interface Guidelines: accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility)).
+6. **Colour is never the only signal.** An error has an icon or text as well as red, and text contrast meets WCAG ratios ([WCAG 2.2](https://www.w3.org/TR/WCAG22/)).
+
+Native Android and iOS widgets produce their semantics nodes themselves. React Native creates native views, so its props map onto the same platform properties. Flutter and Compose Multiplatform draw their own pixels ([runtime anatomy](/foundations/runtime-anatomy/)), so they build their own semantics tree and translate it into the platform's accessibility API.
+
+## A labelled, grouped card in each stack
+
+The same job in each stack: an icon-only favourite button with a label, and a product card read as a single element.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+IconButton(onClick = onFavourite) {
+    Icon(
+        Icons.Default.FavoriteBorder,
+        contentDescription = stringResource(R.string.add_to_favourites),
+    )
+}
+
+Row(
+    Modifier
+        .clickable(onClickLabel = stringResource(R.string.open_product), onClick = onOpen)
+        .semantics(mergeDescendants = true) {},   // one stop for TalkBack
+) {
+    Image(painter, contentDescription = null)      // decorative: skipped
+    Text(product.name)
+    Text(product.formattedPrice)
+}
+```
+Compose builds a semantics tree from modifiers, and Material components fill in roles and states ([semantics in Compose](https://developer.android.com/develop/ui/compose/accessibility/semantics)). `contentDescription = null` marks an image as decorative. Text sized in `sp` follows the system font scale, which goes up to 200% with non-linear scaling since Android 14 ([Android 14 features: non-linear font scaling](https://developer.android.com/about/versions/14/features#non-linear-font-scaling)). `IconButton` enforces the 48 dp minimum touch target. Test with TalkBack on a device, the Accessibility Scanner app, and semantics assertions in Compose UI tests ([test your app's accessibility](https://developer.android.com/guide/topics/ui/accessibility/testing)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+Button(action: onFavourite) {
+    Image(systemName: "heart")
+}
+.accessibilityLabel("Add to favourites")
+
+HStack {
+    Image(product.imageName)
+        .accessibilityHidden(true)               // decorative: skipped
+    Text(product.name)
+    Text(product.price, format: .currency(code: "EUR"))
+}
+.accessibilityElement(children: .combine)        // one stop for VoiceOver
+.accessibilityAddTraits(.isButton)
+```
+SwiftUI controls expose their role (called traits) and value to VoiceOver, and modifiers add labels, hints and grouping ([accessibility fundamentals in SwiftUI](https://developer.apple.com/documentation/swiftui/accessibility-fundamentals)). Text that uses the built-in styles (`.body`, `.headline`) follows Dynamic Type, including the larger accessibility sizes. A custom font needs `relativeTo:` to scale ([applying custom fonts to text](https://developer.apple.com/documentation/swiftui/applying-custom-fonts-to-text)). Test with VoiceOver on a device and Accessibility Inspector in Xcode. `XCUIApplication.performAccessibilityAudit()` runs automated checks for contrast, missing labels and clipped text inside a UI test ([performing accessibility testing for your app](https://developer.apple.com/documentation/accessibility/performing-accessibility-testing-for-your-app)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+<Pressable
+  onPress={onFavourite}
+  accessibilityRole="button"
+  accessibilityLabel={t('add_to_favourites')}
+  hitSlop={8}
+>
+  <HeartIcon />
+</Pressable>
+
+<Pressable
+  onPress={onOpen}
+  accessible                                      // children merge into one element
+  accessibilityRole="button"
+  accessibilityLabel={`${product.name}, ${formattedPrice}`}
+>
+  <Image source={product.image} accessible={false} />
+  <Text>{product.name}</Text>
+  <Text>{formattedPrice}</Text>
+</Pressable>
+```
+A `View` or `Pressable` has no role until you give it one. The accessibility props map to the native properties on each platform, and React Native also accepts web-style `role` and `aria-*` props as aliases ([accessibility](https://reactnative.dev/docs/accessibility)). `Text` scales with the system font size by default (`allowFontScaling`), and `maxFontSizeMultiplier` caps it per element. Lint rules from `eslint-plugin-react-native-a11y` catch missing roles and labels, and React Native Testing Library queries elements by role and label, which fails a test when they are absent ([Testing Library queries](https://callstack.github.io/react-native-testing-library/docs/api/queries)).
+</TabItem>
+<TabItem label="Flutter">
+```dart
+IconButton(
+  icon: const Icon(Icons.favorite_border),
+  tooltip: l10n.addToFavourites,       // also the screen reader label
+  onPressed: onFavourite,
+);
+
+MergeSemantics(                         // one stop for the screen reader
+  child: InkWell(
+    onTap: onOpen,
+    child: Row(children: [
+      ExcludeSemantics(child: Image.asset(product.image)),
+      Text(product.name),
+      Text(formattedPrice),
+    ]),
+  ),
+);
+```
+Flutter builds a semantics tree next to the render tree and sends it to TalkBack and VoiceOver through the engine ([accessibility](https://docs.flutter.dev/ui/accessibility), [assistive technologies](https://docs.flutter.dev/ui/accessibility/assistive-technologies)). Material widgets annotate themselves, and `Semantics`, `MergeSemantics` and `ExcludeSemantics` adjust the result. Text follows the system scale through `MediaQuery.textScalerOf(context)`. Widget tests can assert accessibility guidelines directly ([accessibility testing](https://docs.flutter.dev/ui/accessibility/accessibility-testing)):
+
+```dart
+await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+await expectLater(tester, meetsGuideline(textContrastGuideline));
+```
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: the Compose semantics API, unchanged.
+IconButton(onClick = onFavourite) {
+    Icon(
+        Icons.Default.FavoriteBorder,
+        contentDescription = stringResource(Res.string.add_to_favourites),
+    )
+}
+
+Row(Modifier.clickable(onClick = onOpen).semantics(mergeDescendants = true) {}) {
+    Image(painter, contentDescription = null)
+    Text(product.name)
+    Text(product.formattedPrice)
+}
+```
+Compose Multiplatform uses the same semantics modifiers as Jetpack Compose. On iOS it maps the semantics tree to native accessibility objects, so VoiceOver, Full Keyboard Access and XCTest UI tests work against a Compose screen ([iOS accessibility support](https://kotlinlang.org/docs/multiplatform/compose-ios-accessibility.html)). The same page describes how the tree is synchronised and which settings control it. Verify with VoiceOver on a real device, because the mapping is done by the framework and not by UIKit. With native UI over shared logic, accessibility is entirely each platform's own.
+</TabItem>
+</Tabs>
+
+## Text that grows
+
+The cut-off price and the truncated German button come from the same assumption: that text has a known size. Two settings break it at once, a longer translation and a larger font.
+
+- Let text wrap to more lines before truncating. Truncate only secondary text, never a price or an action.
+- Let rows grow in height. A list row with a fixed height clips at large sizes.
+- Switch a horizontal row to a vertical stack at large sizes. SwiftUI has `ViewThatFits` and `dynamicTypeSize`, Compose has `FlowRow`, Flutter has `Wrap`, and React Native has `flexWrap`.
+- Put every screen in a scroll container. Content that fits at default size overflows at 200%.
+- Do not cap the scale globally to protect a layout. A cap on one tight element, such as a tab bar label, is acceptable when the system offers another way to read it.
+
+## Trade-offs and scale
+
+**Keys or source text.** iOS and gettext-style tools use the English text as the key, which keeps code readable and breaks when two different meanings share one English word. Android, Flutter and most i18next setups use named keys, which need a naming convention. With either approach, give translators context: a comment, a screenshot and the placeholder meanings.
+
+**Translation is a pipeline.** Past a handful of languages, strings go to a translation management system through export and import in CI. XLIFF is the common exchange format, and Xcode and Android Studio both export it. Decide what happens when a translation is missing at release time: fall back to the source language, and report the gap.
+
+**Over-the-air strings.** Downloading translations at runtime fixes typos without a release and adds a failure mode, a cache and a review bypass. Server-driven screens raise the same question for every string the server sends, which should arrive already localized for the `Accept-Language` the app sent.
+
+**Pseudolocales find bugs without translators.** A pseudolocale replaces English with accented, lengthened text ("[Àððð ţö çåŕţ one two]") and a fake right-to-left locale. Hard-coded strings stay plain and stand out, and tight layouts break at once. Android has `en-XA` and `ar-XB` ([test with pseudolocales](https://developer.android.com/guide/topics/resources/pseudolocales)), and Xcode offers pseudolanguages in the scheme's run options ([preparing your interface for localization](https://developer.apple.com/documentation/xcode/preparing-your-interface-for-localization)).
+
+**Screenshot tests cover the matrix.** A snapshot test per screen at the largest font scale, in the longest language and in a right-to-left locale catches clipping in CI. The [testing chapter](/shipping/testing/) covers the tooling.
+
+**Build accessibility into the design system.** If the shared button, card and text field components have roles, labels, target sizes and contrast built in, feature teams get most of it without thinking. Review the remaining custom views with a screen reader before release.
+
+**Automated checks find a minority of issues.** Scanners and lint rules catch missing labels, small targets and low contrast. They cannot tell whether a label makes sense, whether the reading order follows the layout, or whether a flow can be completed. Schedule manual passes with TalkBack and VoiceOver, and include users of assistive technology in testing when you can.
+
+<NoDumbQuestions>
+<dt>Are internationalization and localization the same thing?</dt>
+<dd>Internationalization (i18n) is the engineering that makes an app adaptable: externalized strings, formatters, mirrored layouts. Localization (l10n) is the adapting itself for one market: translation, images, legal text. The first is done once and the second per locale.</dd>
+
+<dt>Should the app have its own language picker?</dt>
+<dd>Usually not. Both platforms offer a per-app language setting in system settings, and an in-app picker has to stay consistent with it. If the product needs one, drive it through the platform API (`AppCompatDelegate.setApplicationLocales` on Android) so that the system setting and the picker agree.</dd>
+
+<dt>Does a content description go on every image?</dt>
+<dd>On every image that carries information the surrounding text does not. A product photo next to the product name is decoration, and describing it makes the screen reader say the name twice. An icon that is the only content of a button always needs a label.</dd>
+
+<dt>Should the label say "button"?</dt>
+<dd>No. The role is announced by the screen reader in the user's language. A label of "Add to favourites button" is read as "Add to favourites button, button".</dd>
+
+<dt>Is accessibility free in Flutter or Compose Multiplatform since the widgets handle it?</dt>
+<dd>The standard widgets carry semantics, as native ones do. Custom-drawn controls carry none until you add them, and since these frameworks draw their own pixels, there is no native view underneath to fall back on. Test both platforms with their screen readers.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| String storage | `res/values-xx/strings.xml` | String Catalog (`.xcstrings`) | JSON per locale | ARB per locale | `composeResources/values-xx/strings.xml` |
+| Lookup | `stringResource(R.string.x)` | `Text("...")`, `String(localized:)` | `t('x')` | `AppLocalizations.of(context)!.x` | `stringResource(Res.string.x)` |
+| Checked at compile time | Yes | With generated symbols | With typed keys | Yes | Yes |
+| Plurals | `<plurals>` | Plural variants in the catalog | `_one`, `_other` key suffixes | ICU `plural` | `<plurals>` |
+| Date and number formatting | `java.time`, `android.icu` | `.formatted()`, `FormatStyle` | `Intl` | `intl` package | `kotlinx-datetime`, platform formatters |
+| Right-to-left layout | `start`/`end`, automatic in Compose | Leading/trailing, automatic | `start`/`end`, `I18nManager` | `Directionality`, directional insets | Automatic in Compose |
+| Per-app language | System setting (13+), `LocaleManager` | System setting | Host platform's | Host platform's | Host platform's |
+| Pseudolocale | `en-XA`, `ar-XB` | Scheme pseudolanguages | Host platform's, i18next plugin | Custom ARB | Host platform's |
+| Screen reader | TalkBack | VoiceOver | Both | Both | Both |
+| Label | `contentDescription` | `accessibilityLabel` | `accessibilityLabel`, `aria-label` | `Semantics(label:)`, `tooltip` | `contentDescription` |
+| Role | `Role.Button` in semantics | Traits | `accessibilityRole`, `role` | `Semantics(button: true)` | `Role.Button` |
+| Group children | `semantics(mergeDescendants = true)` | `accessibilityElement(children: .combine)` | `accessible` | `MergeSemantics` | `semantics(mergeDescendants = true)` |
+| Hide decoration | `contentDescription = null` | `accessibilityHidden(true)` | `accessible={false}` | `ExcludeSemantics` | `contentDescription = null` |
+| Scalable text unit | `sp` | Dynamic Type text styles | `allowFontScaling` | `TextScaler` | `sp` |
+| Minimum target | 48 dp | 44 pt | Host platform's | 48 dp (Material) | 48 dp |
+| Inspection tool | Accessibility Scanner, Layout Inspector | Accessibility Inspector | Both platforms' tools | Both, plus `meetsGuideline` tests | Both platforms' tools |
+
+<Exercise>
+Find the localization or accessibility bug in each snippet and say how to fix it.
+
+1. Kotlin: `Text("You have " + count + " new messages")`
+2. Swift: `formatter.dateFormat = "MM/dd/yyyy"` on a `DateFormatter` whose output is shown to the user.
+3. React Native: `<Pressable onPress={onClose}><CloseIcon /></Pressable>`
+4. Flutter: `Padding(padding: EdgeInsets.only(left: 16), child: Text(title))`
+5. Compose: `Text(price, fontSize = 14.sp, maxLines = 1, modifier = Modifier.width(60.dp))`
+
+<Fragment slot="answer">
+1. The sentence is built by concatenation and is not in a resource. Word order differs by language and the plural form depends on `count`. Use a plural resource with a placeholder.
+2. The pattern fixes month-first order for every user, and readers in day-first countries see a different date. Let the formatter choose the order from the locale: `date.formatted(date: .abbreviated, time: .omitted)`, which also spells out the month so no reader has to guess.
+3. The control has no role and no label, so a screen reader announces nothing useful. Add `accessibilityRole="button"` and a localized `accessibilityLabel`, and `hitSlop` if the icon is smaller than the minimum target.
+4. `left` does not mirror in right-to-left languages. Use `EdgeInsetsDirectional.only(start: 16)`.
+5. The fixed 60 dp width and single line clip the price at larger font scales and for longer currency formats. Remove the fixed width, let the text take the space it needs, and allow wrapping or let the row reflow.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** localizes with `.resx` resource files and exposes accessibility through `SemanticProperties` (description, hint, heading level) on any view.
+- **Ionic / Capacitor** uses web i18n libraries and HTML semantics with ARIA. The WebView exposes the DOM's accessibility tree to TalkBack and VoiceOver.
+- **Lynx** supports accessibility attributes on its elements, which the engine maps to the native accessibility APIs.
+
+## Sources
+
+- Standards: [CLDR plural rules](https://cldr.unicode.org/index/cldr-spec/plural-rules), [WCAG 2.2](https://www.w3.org/TR/WCAG22/), [European Accessibility Act, Directive (EU) 2019/882](https://eur-lex.europa.eu/eli/dir/2019/882/oj), [AccessibleEU: the EAA comes into effect in June 2025](https://accessible-eu-centre.ec.europa.eu/content-corner/news/eaa-comes-effect-june-2025-are-you-ready-2025-01-31_en)
+- Android: [Localize your app](https://developer.android.com/guide/topics/resources/localization), [String resources](https://developer.android.com/guide/topics/resources/string-resource), [Per-app language preferences](https://developer.android.com/guide/topics/resources/app-languages), [Test with pseudolocales](https://developer.android.com/guide/topics/resources/pseudolocales), [Semantics in Compose](https://developer.android.com/develop/ui/compose/accessibility/semantics), [Compose accessibility defaults](https://developer.android.com/develop/ui/compose/accessibility/api-defaults), [Test your app's accessibility](https://developer.android.com/guide/topics/ui/accessibility/testing), [Android 14: non-linear font scaling](https://developer.android.com/about/versions/14/features#non-linear-font-scaling)
+- iOS: [Localizing and varying text with a string catalog](https://developer.apple.com/documentation/xcode/localizing-and-varying-text-with-a-string-catalog), [WWDC25: Explore localization with Xcode](https://developer.apple.com/videos/play/wwdc2025/225/), [Preparing your interface for localization](https://developer.apple.com/documentation/xcode/preparing-your-interface-for-localization), [Accessibility fundamentals in SwiftUI](https://developer.apple.com/documentation/swiftui/accessibility-fundamentals), [Performing accessibility testing for your app](https://developer.apple.com/documentation/accessibility/performing-accessibility-testing-for-your-app), [Human Interface Guidelines: accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility)
+- React Native: [Accessibility](https://reactnative.dev/docs/accessibility), [I18nManager](https://reactnative.dev/docs/i18nmanager), [Expo Localization](https://docs.expo.dev/versions/latest/sdk/localization/), [Expo localization guide](https://docs.expo.dev/guides/localization/), [i18next plurals](https://www.i18next.com/translation-function/plurals)
+- Flutter: [Internationalizing Flutter apps](https://docs.flutter.dev/ui/internationalization), [flutter_gen deprecation](https://docs.flutter.dev/release/breaking-changes/flutter-generate-i10n-source), [Accessibility](https://docs.flutter.dev/ui/accessibility), [Accessibility testing](https://docs.flutter.dev/ui/accessibility/accessibility-testing)
+- KMP / CMP: [Resources setup](https://kotlinlang.org/docs/multiplatform/compose-multiplatform-resources-setup.html), [Localizing strings](https://kotlinlang.org/docs/multiplatform/compose-localize-strings.html), [RTL languages](https://kotlinlang.org/docs/multiplatform/compose-rtl.html), [iOS accessibility support](https://kotlinlang.org/docs/multiplatform/compose-ios-accessibility.html), [moko-resources](https://github.com/icerockdev/moko-resources)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 8 (accessibility) and ch. 15 (localization)

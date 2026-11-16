@@ -1,0 +1,384 @@
+---
+title: Navigation and deep links
+description: How each stack models the back stack as data, with Navigation 3, NavigationStack, Expo Router and go_router, and how a URL from outside the app becomes a stack of screens.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A shop app adds order tracking and sends a push notification when an order ships. The bug reports:
+
+- Tapping the notification opens the order. Pressing back closes the app, where the user expected the order list.
+- A link in the shipping email opens the browser although the app is installed.
+- A signed-out user taps the link, signs in and lands on the home screen. The order they wanted is gone.
+- A user leaves the order screen for a few minutes, the OS kills the process, and the app restarts on the home tab.
+
+All four come from treating navigation as a series of "go to screen X" commands. The fix in every stack is to treat the stack of screens as data.
+
+<BrainPower>
+A user opens `https://shop.example/orders/42` from an email, and the app was not running. The order screen appears. What should the back button show, given that the user never visited any other screen in this session?
+</BrainPower>
+
+## Constraints on a phone
+
+- **A stack, with no address bar.** A browser has one URL and a history the browser owns. A mobile app keeps a stack of live screens with their state, and the app owns it.
+- **The OS has a back gesture.** Android's system back and the iOS edge swipe both pop the stack. With predictive back, enabled by default for apps targeting Android 16 ([behavior changes](https://developer.android.com/about/versions/16/behavior-changes-16#predictive-back)), the system animates a preview of the screen underneath during the gesture, so it has to know what back will do before the gesture finishes.
+- **Several stacks exist at once.** Each tab keeps its own stack, and a modal sheet sits on top of all of them.
+- **Users enter from outside.** A link, a notification, a widget, a home screen shortcut or a search result can open any screen directly, with the app running or not.
+- **The OS decides who opens a link.** For `https` links, Android and iOS check a file on your web server before handing the link to your app.
+- **The process can die.** The stack has to be saved and restored ([app lifecycle](/foundations/app-lifecycle/)).
+
+## The pattern
+
+1. **A route is a value.** Each destination is a typed value with its arguments: `Order(id = 42)`. Pass identifiers, and let the screen load the object.
+2. **The back stack is a list of routes.** Navigating forward appends, back removes the last element, and "sign out" replaces the list.
+3. **The UI renders the list.** A navigation container shows the top entry and animates changes. It is a function of the list, as any other UI is a function of state ([state management](/core-patterns/state-management/)).
+4. **A deep link is parsed into a list.** `https://shop.example/orders/42` becomes `[Home, Orders, Order(42)]`. The entries below the top are called a synthetic back stack. They give back somewhere to go, which answers the Brain Power question: back shows the order list.
+5. **Guards are functions of state.** "Needs sign-in" is a check on the target route that redirects to the sign-in route and remembers the original target.
+6. **Restoring is deserializing.** A list of serializable routes can be saved before process death and rebuilt after it.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  src: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  mid: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  out: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+sources: "" {
+  grid-columns: 3
+  grid-gap: 12
+  style.stroke-width: 0
+  style.fill: transparent
+  s1: "Email link" { class: src }
+  s2: "Push notification" { class: src }
+  s3: "Widget or shortcut" { class: src }
+}
+url: "URL\nhttps://shop.example/orders/42" { class: box }
+parser: "Route parser\n+ sign-in guard" { class: mid }
+stack: "Back stack\n[Home, Orders, Order(42)]" { class: out }
+ui: "Navigation container\nshows Order(42)" { class: box }
+sources -> url
+url -> parser
+parser -> stack
+stack -> ui
+```
+
+Notifications, widgets and shortcuts go through the same parser. Give each of them a URL as its payload and there is one entry path to test.
+
+## Links from outside the app
+
+| | Custom scheme | Verified web link |
+| --- | --- | --- |
+| Looks like | `shop://orders/42` | `https://shop.example/orders/42` |
+| Names | URL scheme, deep link | Android App Links, iOS universal links |
+| Who can claim it | Any app that declares the scheme | Only the app the domain vouches for |
+| App not installed | Nothing happens, or an error | The website opens |
+| Setup | A manifest or `Info.plist` entry | The entry plus a file hosted on the domain |
+
+For verified links, the OS downloads a file from your domain that lists the apps allowed to open its URLs.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  os: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  web: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App" { class: box }
+os: "OS" { class: os }
+site: "https://shop.example" { class: web }
+app -> os: "1. installed, declares\nshop.example" { style.font-size: 16 }
+os -> site: "2. fetch /.well-known/ file" { style.font-size: 16 }
+site -> os: "3. file lists this app's ID" { style.font-size: 16 }
+os -> app: "4. links open the app" { style.font-size: 16 }
+```
+
+- **Android** reads `/.well-known/assetlinks.json`, which contains your package name and signing certificate fingerprint. The intent filter carries `android:autoVerify="true"` ([verify App Links](https://developer.android.com/training/app-links/verify-android-applinks)).
+- **iOS** reads `/.well-known/apple-app-site-association`, which contains your app ID and the paths it handles. The app lists the domain under the Associated Domains entitlement as `applinks:shop.example`. Apple's CDN fetches the file on the device's behalf ([supporting associated domains](https://developer.apple.com/documentation/xcode/supporting-associated-domains)).
+
+Both files are served over HTTPS without redirects. React Native, Flutter and KMP apps are native apps underneath ([runtime anatomy](/foundations/runtime-anatomy/)), so they need the same two files and the same manifest and entitlement entries.
+
+<Aside type="caution" title="Watch it!">
+Firebase Dynamic Links, which many apps used for links that survive an app install, was shut down on August 25, 2025 ([Dynamic Links deprecation FAQ](https://firebase.google.com/support/dynamic-links-faq)). Older tutorials still recommend it. For plain deep links, use App Links and universal links. For links that carry a destination through a store install (deferred deep links), you need a paid attribution service or your own install-referrer handling.
+</Aside>
+
+## A stack of routes in each stack
+
+The same job in each stack: routes for a home screen and an order screen, a back stack held as data, and a parser that turns an order URL into a back stack.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Serializable data object Home : NavKey
+@Serializable data object Orders : NavKey
+@Serializable data class OrderDetail(val id: Long) : NavKey
+
+@Composable
+fun ShopApp(startLink: Uri?) {
+    // A list you own. It survives rotation and process death.
+    val backStack = rememberNavBackStack(*routesFor(startLink).toTypedArray())
+
+    NavDisplay(
+        backStack = backStack,
+        onBack = { backStack.removeLastOrNull() },
+        entryProvider = entryProvider {
+            entry<Home> { HomeScreen(onOpenOrders = { backStack.add(Orders) }) }
+            entry<Orders> { OrdersScreen(onOpen = { backStack.add(OrderDetail(it)) }) }
+            entry<OrderDetail> { key -> OrderScreen(key.id) }
+        },
+    )
+}
+
+// https://shop.example/orders/42 -> [Home, Orders, OrderDetail(42)]
+fun routesFor(link: Uri?): List<NavKey> {
+    val id = link?.pathSegments
+        ?.takeIf { it.size == 2 && it[0] == "orders" }
+        ?.get(1)?.toLongOrNull()
+    return if (id != null) listOf(Home, Orders, OrderDetail(id)) else listOf(Home)
+}
+```
+This is Navigation 3 (1.2), the Compose-first library in which the back stack is a state list your code owns ([Navigation 3](https://developer.android.com/guide/navigation/navigation-3)). Since 1.2.0 it also ships `DeepLinkRequest`, `DeepLinkMatcher` and `BackStackMatcher` to do the URL matching and build the synthetic back stack for you ([deep links in Navigation 3](https://developer.android.com/guide/navigation/navigation-3/deep-links)). Most existing apps use Navigation 2 (`NavHost` and `NavController`, 2.10), where the library owns the stack and you send it commands. It has type-safe routes and a `deepLink` declaration per destination ([Navigation with Compose](https://developer.android.com/develop/ui/compose/navigation)). The link reaches either library as an `Intent` delivered to the activity that declared the intent filter.
+</TabItem>
+<TabItem label="iOS">
+```swift
+enum Route: Hashable, Codable {
+    case orders
+    case order(id: Int)
+}
+
+struct ShopApp: View {
+    @State private var path: [Route] = []   // the stack above the root
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            HomeScreen(onOpenOrders: { path.append(.orders) })
+                .navigationDestination(for: Route.self) { route in
+                    switch route {
+                    case .orders: OrdersScreen(onOpen: { path.append(.order(id: $0)) })
+                    case .order(let id): OrderScreen(id: id)
+                    }
+                }
+        }
+        .onOpenURL { url in path = routes(for: url) }
+    }
+}
+
+// https://shop.example/orders/42 -> [.orders, .order(id: 42)]
+func routes(for url: URL) -> [Route] {
+    let parts = url.pathComponents.filter { $0 != "/" }
+    if parts.count == 2, parts[0] == "orders", let id = Int(parts[1]) {
+        return [.orders, .order(id: id)]
+    }
+    return []
+}
+```
+`NavigationStack` binds to an array of `Hashable` values, and `navigationDestination(for:)` maps each value type to a view ([NavigationStack](https://developer.apple.com/documentation/swiftui/navigationstack)). The root view is fixed, so the path holds only the entries above it. `onOpenURL` receives both custom scheme URLs and universal links ([onOpenURL](https://developer.apple.com/documentation/swiftui/view/onopenurl(perform:))). Because `Route` is `Codable`, the path can be saved with `@SceneStorage` and restored after process death. A `TabView` with one `NavigationStack` and one path per tab gives each tab its own stack. UIKit apps do the same with a `UINavigationController` and coordinators that own it.
+</TabItem>
+<TabItem label="React Native">
+```
+app/
+  _layout.tsx          root stack
+  index.tsx            /            home
+  orders/
+    _layout.tsx        stack for /orders
+    index.tsx          /orders
+    [id].tsx           /orders/42
+```
+```tsx
+// app/orders/_layout.tsx
+import { Stack } from 'expo-router';
+
+// Opened directly by a link: put /orders under /orders/42.
+export const unstable_settings = { anchor: 'index' };
+
+export default function OrdersLayout() {
+  return <Stack />;
+}
+
+// app/orders/[id].tsx
+import { useLocalSearchParams } from 'expo-router';
+
+export default function OrderScreen() {
+  const { id } = useLocalSearchParams<{ id: string }>();
+  return <OrderDetails id={Number(id)} />;
+}
+
+// Anywhere: navigate by URL.
+router.push('/orders/42');
+```
+Expo Router (SDK 58) derives routes from files, so every screen has a URL and is deep-linkable with no parser to write ([Expo Router introduction](https://docs.expo.dev/router/introduction/)). The `anchor` setting provides the synthetic back stack for a stack that was entered by a link ([router settings](https://docs.expo.dev/router/advanced/router-settings/)). Verified links still need the associated domain and intent filter entries in the app config ([linking guide](https://docs.expo.dev/linking/overview/)). Expo Router is built on React Navigation, which you can also use directly: its static configuration declares screens as an object and generates the link paths and TypeScript types from it ([React Navigation: static configuration](https://reactnavigation.org/docs/static-configuration/)). Both render native stack containers through `react-native-screens`, so the back swipe and transitions come from UIKit and Android.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+final router = GoRouter(
+  routes: [
+    GoRoute(
+      path: '/',
+      builder: (context, state) => const HomeScreen(),
+      routes: [
+        GoRoute(
+          path: 'orders',
+          builder: (context, state) => const OrdersScreen(),
+          routes: [
+            GoRoute(
+              path: ':id',
+              builder: (context, state) =>
+                  OrderScreen(id: int.parse(state.pathParameters['id']!)),
+            ),
+          ],
+        ),
+      ],
+    ),
+  ],
+  // Guard: runs before every navigation.
+  redirect: (context, state) {
+    final signedIn = auth.isSignedIn;
+    if (!signedIn && state.matchedLocation != '/sign-in') {
+      return '/sign-in?from=${Uri.encodeComponent(state.uri.toString())}';
+    }
+    return null;
+  },
+);
+
+// In a widget:
+context.go('/orders/42');   // stack becomes [/, /orders, /orders/42]
+```
+`go_router` (18.x) is published by the Flutter team and sits on Flutter's `Router` API. The team describes it as feature-complete and in maintenance ([go_router on pub.dev](https://pub.dev/packages/go_router)). Nested routes give the synthetic back stack for free: `go('/orders/42')` builds every parent on the way. `context.push` adds one page on top of the current stack instead. Flutter handles incoming links itself and passes them to the router, on by default since Flutter 3.27 ([deep linking](https://docs.flutter.dev/ui/navigation/deep-linking)). A link-handling plugin that wants the URL first needs that default turned off. `Navigator.push` with widget routes still works and suits small apps without deep links ([navigation overview](https://docs.flutter.dev/ui/navigation)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: routes and parsing are shared with every platform.
+@Serializable sealed interface Route : NavKey
+@Serializable data object Home : Route
+@Serializable data object Orders : Route
+@Serializable data class OrderDetail(val id: Long) : Route
+
+fun routesFor(path: String?): List<Route> {
+    val parts = path?.trim('/')?.split('/') ?: return listOf(Home)
+    val id = parts.getOrNull(1)?.toLongOrNull()
+    return if (parts.firstOrNull() == "orders" && id != null) {
+        listOf(Home, Orders, OrderDetail(id))
+    } else listOf(Home)
+}
+```
+Compose Multiplatform supports Navigation 3 on Android, iOS, desktop and web since version 1.10, with the same `NavDisplay` API as on Android ([Navigation 3 in Compose Multiplatform](https://kotlinlang.org/docs/multiplatform/compose-navigation-3.html)). On non-JVM targets the route classes need an explicit polymorphic serializer registration, which the same page describes. The multiplatform build of Navigation 2 is also available, with deep link patterns per destination ([deep links](https://kotlinlang.org/docs/multiplatform/compose-navigation-deep-links.html)). Each platform still receives the link natively, in the Android activity and in the iOS app delegate or `onOpenURL`, and forwards it to shared code. With native UI on each platform, navigation stays in SwiftUI and Compose, and the shared module can own the route types and the URL parser. [Decompose](https://arkivanov.github.io/Decompose/) is a third-party alternative that keeps the navigation stack in shared code under either UI.
+</TabItem>
+</Tabs>
+
+## Guards and the remembered destination
+
+The signed-out user from the opening lost their destination because the app replaced the stack with the sign-in screen and forgot the link. A guard that works keeps three pieces of data: the route the user asked for, the fact that sign-in is required, and the place to continue afterwards.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  warn: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+lnk: "Link: /orders/42" { class: box }
+check: "Signed in?" { shape: diamond; style.font-size: 16 }
+show: "Stack: [Home, Orders, Order(42)]" { class: ok }
+login: "Stack: [SignIn(then: /orders/42)]" { class: warn }
+lnk -> check
+check -> show: "yes" { style.font-size: 16 }
+check -> login: "no" { style.font-size: 16 }
+login -> show: "after sign-in" { style.font-size: 16 }
+```
+
+The Flutter sample passes the target in the sign-in URL. With a back stack you own (Navigation 3, `NavigationStack`), store the pending route list in the sign-in route's arguments and swap it in on success. In Expo Router, protected routes in a layout hide screens from signed-out users, and the redirect carries the original `href` ([authentication in Expo Router](https://docs.expo.dev/router/advanced/authentication/)).
+
+Treat every link as untrusted input. Anyone can craft `shop://orders/42?admin=true`, and on Android any app can send it. Parse strictly, ignore unknown parameters, and let the server decide whether this user may see order 42.
+
+## Trade-offs and scale
+
+**Feature modules should not know each other's screens.** In a large app, the checkout team cannot import the profile team's composables without coupling the build. Each feature exposes its route types in a small API module and registers its screens with the app's navigation container at startup. The `entryProvider` in Navigation 3, a route table in go_router and a folder in Expo Router all work as that registry ([dependency injection and modularization](/core-patterns/dependency-injection/)).
+
+**Navigate from the state holder or from the UI.** Calling the navigator inside a ViewModel makes it hard to test and ties it to one UI. The common split: the state holder exposes "order placed" as state or an event, and the screen's caller turns that into a route change ([one-time events](/core-patterns/state-management/#one-time-events)).
+
+**One URL scheme for everything.** When notifications, widgets, in-app banners from the server and email links all carry the same URLs, one parser and one set of tests cover them. The route table becomes an API that old app versions must keep honouring, so add routes and avoid changing the meaning of existing ones.
+
+**Unknown links need a fallback.** An older app version will receive links to screens it does not have. Fall back to the nearest parent screen or open the URL in an in-app browser. Never crash, and never show an empty screen.
+
+**Test links from the command line.** Each platform can fire a link without an email client:
+
+```sh
+adb shell am start -a android.intent.action.VIEW -d "https://shop.example/orders/42"
+xcrun simctl openurl booted "https://shop.example/orders/42"
+npx uri-scheme open "shop://orders/42" --ios
+```
+
+Android also shows the verification state of each domain with `adb shell pm get-app-links <package>` ([verify App Links](https://developer.android.com/training/app-links/verify-android-applinks)).
+
+**Adaptive layouts change what "a screen" means.** On a tablet or a foldable, the order list and the order detail are visible together. Libraries that render the back stack as data can show the top two entries side by side (Navigation 3 scenes, `NavigationSplitView` on iOS) without changing the routes.
+
+<NoDumbQuestions>
+<dt>Is a deep link the same as a universal link?</dt>
+<dd>A deep link is any link that opens a specific place inside an app. Universal links (iOS) and App Links (Android) are deep links that use `https` URLs and are verified against your domain.</dd>
+
+<dt>Should I pass the whole object to the next screen?</dt>
+<dd>Pass the ID. A route has to survive serialization for deep links and process death, and a copied object goes stale. The destination screen loads the object from the data layer, which is the single source of truth.</dd>
+
+<dt>My verified link opens the browser. Where do I look first?</dt>
+<dd>At the file on the server. It must be reachable at the exact `/.well-known/` path over HTTPS with no redirect, with the right content type, and it must list the certificate fingerprint or app ID of the build you are testing. Debug builds are often signed with a different key than the store build.</dd>
+
+<dt>Does the Android back button need special handling on iOS-first designs?</dt>
+<dd>Yes. Every screen, sheet and dialog must respond to system back. If your own code intercepts back (to confirm discarding a form, for example), register the handler through the navigation library or `BackHandler` so that predictive back can tell in advance whether the gesture is handled.</dd>
+
+<dt>Do tabs share one back stack?</dt>
+<dd>Each tab keeps its own stack, and switching tabs preserves them. On Android, system back from a non-start tab usually returns to the start tab before leaving the app. On iOS there is no system back between tabs.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Navigation container | `NavDisplay` (Nav 3), `NavHost` (Nav 2) | `NavigationStack` | `<Stack>` in a layout | `Navigator`, `MaterialApp.router` | `NavDisplay`, `NavHost` |
+| Route | `@Serializable` `NavKey` | `Hashable` value | File path, `href` | Path string, typed route | `@Serializable` `NavKey` |
+| Back stack | `NavBackStack` list you own | Bound `path` array | Navigation state from URLs | `GoRouter` match list | `NavBackStack` |
+| Push | `backStack.add(route)` | `path.append(route)` | `router.push(href)` | `context.push(location)` | `backStack.add(route)` |
+| Pop | `backStack.removeLastOrNull()` | `path.removeLast()` | `router.back()` | `context.pop()` | `backStack.removeLastOrNull()` |
+| Replace the stack | Assign new contents | `path = [...]` | `router.replace(href)` | `context.go(location)` | Assign new contents |
+| Tabs | One back stack per tab | `TabView` with a stack per tab | `<Tabs>`, native tabs | `StatefulShellRoute` | One back stack per tab |
+| Modal | Dialog or bottom sheet scene | `.sheet`, `.fullScreenCover` | `presentation: 'modal'` | `showModalBottomSheet`, `fullscreenDialog` | Dialog scene |
+| Receive a link | `Intent` in the activity | `onOpenURL` | Handled by the router | Handled by the engine and router | Per platform, forwarded to shared code |
+| Verified link file | `assetlinks.json` | `apple-app-site-association` | Both | Both | Both |
+| Guard | Check before changing the list | Check before changing `path` | Protected routes, `<Redirect>` | `redirect` callback | Check in shared code |
+| Save across process death | `rememberNavBackStack` | `@SceneStorage` with a `Codable` path | Manual: save and restore the navigation state | `restorationScopeId` | `rememberNavBackStack` |
+
+<Exercise>
+Your app has two tabs, Shop and Account. The Account tab has a stack: account home, order list, order detail. Write the back stack, as a list of routes, that each of these should produce. Assume the user is signed in unless stated.
+
+1. The user taps a push notification for order 42 while the app is closed.
+2. The user taps the same notification while the app is open on a product page in the Shop tab.
+3. A signed-out user opens `https://shop.example/orders/42`.
+4. An old app version receives `https://shop.example/gift-cards/7`, a screen added in a later release.
+
+<Fragment slot="answer">
+1. Account tab selected, with `[AccountHome, Orders, Order(42)]`. Back goes to the order list, then account home.
+2. The Shop tab's stack is left alone. The Account tab is selected and its stack becomes `[AccountHome, Orders, Order(42)]`. When the user switches back to Shop, the product page is still there.
+3. `[SignIn(then: "/orders/42")]`. After sign-in succeeds, the stack is replaced with the answer to 1. If the signed-in account does not own order 42, the server refuses and the app shows the order list.
+4. The parser finds no match. Open the URL in an in-app browser tab over the current stack, or fall back to `[ShopHome]`. Log the unmatched path so you can see how often old versions hit it.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** uses Shell, with URI-based routes registered per page and `GoToAsync("orders/42")`.
+- **Ionic / Capacitor** uses the web framework's router. Capacitor's App plugin delivers incoming links through an `appUrlOpen` event.
+- **Lynx** leaves navigation to the host app or to a router from its React-based layer. Each Lynx page is typically hosted in a native container that the native navigation stack manages.
+
+## Sources
+
+- Android: [Navigation 3](https://developer.android.com/guide/navigation/navigation-3), [Deep links in Navigation 3](https://developer.android.com/guide/navigation/navigation-3/deep-links), [Navigation 3 releases](https://developer.android.com/jetpack/androidx/releases/navigation3) (1.2), [Navigation with Compose](https://developer.android.com/develop/ui/compose/navigation), [Verify Android App Links](https://developer.android.com/training/app-links/verify-android-applinks), [Predictive back](https://developer.android.com/guide/navigation/custom-back/predictive-back-gesture), [Android 16 behavior changes](https://developer.android.com/about/versions/16/behavior-changes-16)
+- iOS: [NavigationStack](https://developer.apple.com/documentation/swiftui/navigationstack), [onOpenURL](https://developer.apple.com/documentation/swiftui/view/onopenurl(perform:)), [Supporting associated domains](https://developer.apple.com/documentation/xcode/supporting-associated-domains), [Supporting universal links in your app](https://developer.apple.com/documentation/xcode/supporting-universal-links-in-your-app), [Allowing apps and websites to link to your content](https://developer.apple.com/documentation/xcode/allowing-apps-and-websites-to-link-to-your-content)
+- React Native: [Expo Router introduction](https://docs.expo.dev/router/introduction/), [Router settings](https://docs.expo.dev/router/advanced/router-settings/), [Authentication in Expo Router](https://docs.expo.dev/router/advanced/authentication/), [Linking overview](https://docs.expo.dev/linking/overview/), [React Navigation: static configuration](https://reactnavigation.org/docs/static-configuration/), [React Navigation: deep linking](https://reactnavigation.org/docs/deep-linking/)
+- Flutter: [Navigation and routing](https://docs.flutter.dev/ui/navigation), [Deep linking](https://docs.flutter.dev/ui/navigation/deep-linking), [go_router](https://pub.dev/packages/go_router) (18.x)
+- KMP / CMP: [Navigation 3 in Compose Multiplatform](https://kotlinlang.org/docs/multiplatform/compose-navigation-3.html), [Navigation in Compose](https://kotlinlang.org/docs/multiplatform/compose-navigation.html), [Deep links](https://kotlinlang.org/docs/multiplatform/compose-navigation-deep-links.html), [Decompose](https://arkivanov.github.io/Decompose/)
+- Links: [Firebase Dynamic Links deprecation FAQ](https://firebase.google.com/support/dynamic-links-faq)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 4 (deeplinks) and ch. 13 (navigation architecture within large apps)

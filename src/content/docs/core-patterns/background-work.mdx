@@ -1,0 +1,357 @@
+---
+title: Background work and push notifications
+description: How each stack runs work when the app is not on screen, with WorkManager, BGTaskScheduler and their cross-platform wrappers, and how a push notification travels from your server through FCM and APNs to a device.
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A photo-sharing app ships uploads and notifications. The bug reports:
+
+- A user selects 40 photos, taps "Upload" and switches to another app. Six photos arrive.
+- The nightly sync runs on the team's test phones. On many users' phones it has not run for a week.
+- A "new comment" notification arrives. The user taps it, and the app shows the photo without the comment.
+- After a user signs out and a friend signs in on the same phone, the friend receives the first user's notifications.
+
+The first two are code that assumed the app keeps running. The last two are a push pipeline with a missing step.
+
+<BrainPower>
+Your app schedules a periodic sync "every 15 minutes". A user opens the app once a week. Roughly how often will the operating system run that sync, and who decides?
+</BrainPower>
+
+## Constraints on a phone
+
+[App lifecycle and process death](/foundations/app-lifecycle/) established that the OS owns your process. Background work is where that rule costs the most.
+
+- **A backgrounded app stops.** iOS suspends an app within seconds of it leaving the screen. Android lets the process run a little longer and then restricts it, and kills it when memory is needed.
+- **The OS schedules deferred work to save battery.** Android's Doze and App Standby Buckets delay jobs and network access for apps the user rarely opens ([Doze and App Standby](https://developer.android.com/training/monitoring-device-state/doze-standby), [App Standby Buckets](https://developer.android.com/topic/performance/appstandby)). iOS runs background tasks at times it picks from the user's usage pattern, and may not run them at all ([BGTaskScheduler](https://developer.apple.com/documentation/backgroundtasks/bgtaskscheduler)). This answers the Brain Power question: for an app opened weekly, a "15 minute" sync may run once a day or less, and the OS decides.
+- **Long-running work must be visible.** Android requires a foreground service with a notification and a declared type, and limits which types may start from the background ([foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types)). The `dataSync` type is capped at about six hours per day for apps targeting Android 15 or later ([foreground service timeouts](https://developer.android.com/develop/background-work/services/fgs/timeout)).
+- **One connection carries all pushes.** Apps do not hold their own sockets open in the background. The OS keeps a single connection to Apple's or Google's push service, and every app's notifications travel over it.
+- **Notifications need permission.** iOS has always asked. Android asks at runtime since Android 13 ([notification permission](https://developer.android.com/develop/ui/views/notifications/notification-permission)).
+
+## Classify the work first
+
+The right API depends on two questions: did the user just ask for this, and how long does it take?
+
+```d2
+classes: {
+  head: { shape: text; style: { font-size: 18; bold: true } }
+  box: { style: { font-size: 16 } }
+  a: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  b: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  c: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  d: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 3
+grid-columns: 4
+grid-gap: 12
+h1: "Finish up" { class: head }
+h2: "User-started,\nlong" { class: head }
+h3: "Deferrable" { class: head }
+h4: "Server-triggered" { class: head }
+e1: "Save a draft,\nsend one message" { class: a }
+e2: "Upload 40 photos,\nexport a video" { class: b }
+e3: "Sync, cleanup,\nlog upload" { class: c }
+e4: "New message,\nprice drop" { class: d }
+t1: "A few seconds of\ngrace after\nbackgrounding" { class: box }
+t2: "Hand the transfer\nto the OS, or show\nongoing progress" { class: box }
+t3: "Scheduler with\nconstraints. The OS\npicks the time" { class: box }
+t4: "Push notification" { class: box }
+```
+
+The 40-photo upload was in the second column and was written as if it were in the first.
+
+## The pattern
+
+1. **Persist the request before starting.** "Upload these 40 files" is written to the database as a queue ([persistence](/core-patterns/persistence/)). The background job reads the queue, so it can continue after the process was killed.
+2. **Make the work idempotent and resumable.** A job can be stopped at any moment and run again later. Each item is marked done when it finishes, and repeating an item causes no harm ([idempotency](/core-patterns/networking/#retries-and-idempotency)).
+3. **State constraints, not times.** "When on an unmetered network and charging" is something the OS can honour. "At 02:00 exactly" is not, unless the feature is an alarm clock.
+4. **Stop when told.** The OS gives a job a time budget and a signal when it expires. The job saves progress and returns.
+5. **Treat a push as a hint.** A push says "something changed". The app then fetches the truth from the server. Delivery is not guaranteed, so the app also syncs when it is opened.
+
+## A constrained sync job in each stack
+
+The same job in each stack: sync pending changes about once a day, only when a network is available.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+class SyncWorker(
+    context: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result =
+        try {
+            syncRepository.syncPending()     // cancelled if the OS stops the work
+            Result.success()
+        } catch (e: IOException) {
+            Result.retry()                   // run again with backoff
+        }
+}
+
+fun scheduleSync(context: Context) {
+    val request = PeriodicWorkRequestBuilder<SyncWorker>(24, TimeUnit.HOURS)
+        .setConstraints(
+            Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+        )
+        .build()
+
+    WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+        "sync",
+        ExistingPeriodicWorkPolicy.KEEP,     // scheduling twice keeps one job
+        request,
+    )
+}
+```
+WorkManager (2.12) is the recommended API for work that must run even if the app exits or the device restarts. It stores requests in its own database and runs them through the system's JobScheduler ([WorkManager](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started)). The minimum period is 15 minutes, and the actual time depends on Doze and the app's standby bucket. For the photo upload, a user-initiated data transfer job (Android 14+) runs a long transfer with a system notification and without the foreground service time limit ([user-initiated data transfer](https://developer.android.com/develop/background-work/background-tasks/uidt)). Android's overview page maps each kind of task to an API ([background tasks overview](https://developer.android.com/develop/background-work/background-tasks)).
+</TabItem>
+<TabItem label="iOS">
+```swift
+@main
+struct PhotosApp: App {
+    @Environment(\.scenePhase) private var phase
+
+    var body: some Scene {
+        WindowGroup { RootView() }
+            .onChange(of: phase) { _, newPhase in
+                if newPhase == .background { scheduleSync() }
+            }
+            // The system launches or resumes the app to run this.
+            .backgroundTask(.appRefresh("example.photos.sync")) {
+                scheduleSync()                       // ask for the next one
+                try? await syncRepository.syncPending()
+            }
+    }
+}
+
+func scheduleSync() {
+    let request = BGAppRefreshTaskRequest(identifier: "example.photos.sync")
+    request.earliestBeginDate = .now.addingTimeInterval(24 * 60 * 60)
+    try? BGTaskScheduler.shared.submit(request)
+}
+```
+The identifier is also listed under `BGTaskSchedulerPermittedIdentifiers` in `Info.plist`. An app refresh task gets a short window at a time the system picks, and when the window closes the system cancels the Swift task ([backgroundTask modifier](https://developer.apple.com/documentation/swiftui/scene/backgroundtask(_:action:)), [using background tasks to update your app](https://developer.apple.com/documentation/uikit/using-background-tasks-to-update-your-app)). `BGProcessingTask` gives minutes and can require power and network. For the photo upload, a background `URLSession` hands the files to a system daemon that continues after the app is suspended or killed and relaunches the app when the transfers finish ([downloading files in the background](https://developer.apple.com/documentation/foundation/downloading-files-in-the-background)). `BGContinuedProcessingTask` (iOS 26+) continues work the user started, such as an export, with system UI showing its progress ([WWDC25: Finish tasks in the background](https://developer.apple.com/videos/play/wwdc2025/227/)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import * as BackgroundTask from 'expo-background-task';
+import * as TaskManager from 'expo-task-manager';
+
+const SYNC = 'sync-pending';
+
+// Top level of the entry file: runs even when no UI is mounted.
+TaskManager.defineTask(SYNC, async () => {
+  try {
+    await syncPending();
+    return BackgroundTask.BackgroundTaskResult.Success;
+  } catch {
+    return BackgroundTask.BackgroundTaskResult.Failed;
+  }
+});
+
+export async function scheduleSync() {
+  await BackgroundTask.registerTaskAsync(SYNC, {
+    minimumInterval: 24 * 60,   // minutes; the OS may wait longer
+  });
+}
+```
+`expo-background-task` schedules through WorkManager on Android and `BGTaskScheduler` on iOS, so every constraint from the other two tabs applies ([BackgroundTask](https://docs.expo.dev/versions/latest/sdk/background-task/)). It replaces the deprecated `expo-background-fetch`. The task is defined at the top level of the bundle because the OS may start the app with no screen: the JavaScript runtime boots, runs the task function and stops, without rendering a component. On Android this mechanism is called Headless JS ([Headless JS](https://reactnative.dev/docs/headless-js-android)). Large uploads should go through a native background transfer module, since a JavaScript loop stops when the app is suspended.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+@pragma('vm:entry-point')   // keep this function in release builds
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    // A fresh isolate: no widgets, no app state. Set up what the task needs.
+    final repository = await createSyncRepository();
+    await repository.syncPending();
+    return true;             // false asks for a retry
+  });
+}
+
+Future<void> scheduleSync() async {
+  await Workmanager().initialize(callbackDispatcher);
+  await Workmanager().registerPeriodicTask(
+    'sync',
+    'syncPending',
+    frequency: const Duration(hours: 24),
+    constraints: Constraints(networkType: NetworkType.connected),
+  );
+}
+```
+The `workmanager` plugin (0.10) from Flutter Community wraps WorkManager and `BGTaskScheduler` ([workmanager](https://pub.dev/packages/workmanager)). The callback is a top-level function because the plugin starts a new Flutter engine and a new isolate for it, separate from the one that runs the UI ([background processes](https://docs.flutter.dev/packages-and-plugins/background-processes)). Nothing from the UI isolate's memory exists there ([concurrency](/foundations/concurrency/)), so the task builds its own database connection and HTTP client. The iOS setup still needs the identifier in `Info.plist` and registration in the app delegate.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: the work itself is shared.
+class SyncRepository(private val db: AppDatabase, private val api: SyncApi) {
+    suspend fun syncPending() { /* drain the outbox, pull changes */ }
+}
+
+// androidMain: a WorkManager worker calls it.
+class SyncWorker(context: Context, params: WorkerParameters) :
+    CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        sharedGraph.syncRepository.syncPending()
+        return Result.success()
+    }
+}
+```
+```swift
+// iosApp: a BGTaskScheduler handler calls the same function.
+.backgroundTask(.appRefresh("example.photos.sync")) {
+    try? await sharedGraph.syncRepository.syncPending()
+}
+```
+Kotlin Multiplatform has no common scheduling API, because the two schedulers have different rules. The shared module owns the logic, and each platform owns a thin entry point written against WorkManager or BackgroundTasks. Cancelling the Swift task has to reach the coroutine, which depends on the interop layer in use ([concurrency](/foundations/concurrency/#load-parse-show)). The same split applies to push: the FCM service and the `UNUserNotificationCenter` delegate are platform code that forwards tokens and payloads to shared code.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Watch it!">
+Some Android manufacturers add their own battery managers that stop background work and block push delivery for apps the user has not opened recently, beyond what stock Android does. A job that runs on a Pixel can stay silent on other brands. Test on the brands your users own, and design every feature to recover on the next app open ([Don't kill my app](https://dontkillmyapp.com/) tracks the behaviour per manufacturer).
+</Aside>
+
+## A push from your server to a device
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  app: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  srv: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  push: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+shape: sequence_diagram
+app: "App" { class: app }
+os: "OS push client" { class: box }
+backend: "Your backend" { class: srv }
+service: "APNs or FCM" { class: push }
+app -> os: "1. register" { style.font-size: 16 }
+os -> app: "2. device token" { style.font-size: 16 }
+app -> backend: "3. token + user ID" { style.font-size: 16 }
+backend -> service: "4. payload + token\n(after an event)" { style.font-size: 16 }
+service -> os: "5. deliver over the\nshared connection" { style.font-size: 16 }
+os -> app: "6. show it,\nor wake the app" { style.font-size: 16 }
+```
+
+1. The app registers with the OS and receives a device token: an address for this app on this device.
+2. The app sends the token to your backend, which stores it against the signed-in user. A user with a phone and a tablet has two tokens.
+3. When something happens, the backend sends a payload and a token to Apple Push Notification service (APNs) or Firebase Cloud Messaging (FCM).
+4. The push service delivers it over the device's shared connection, and the OS shows the notification or wakes the app.
+
+On Android, FCM is the transport for devices with Google Play services ([FCM architecture](https://firebase.google.com/docs/cloud-messaging/fcm-architecture)). On iOS, APNs is the only transport, and FCM, Expo's push service and every other provider forward to it ([sending notification requests to APNs](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns)).
+
+### Token lifecycle
+
+Tokens change: after a reinstall, a restore to a new device, or when the push service rotates them. The app sends the current token to the backend on every launch and whenever the SDK reports a new one. On sign-out the app tells the backend to detach the token from the user, which fixes the wrong-recipient bug from the opening. When APNs or FCM reports a token as invalid, the backend deletes it ([FCM: manage registration tokens](https://firebase.google.com/docs/cloud-messaging/manage-tokens)).
+
+### Kinds of message
+
+| | Shown by the OS | Handled by app code |
+| --- | --- | --- |
+| iOS | Alert push with `alert`, `sound`, `badge` | Background push with `content-available: 1` |
+| Android (FCM) | Notification message | Data message, delivered to `FirebaseMessagingService` |
+| App not running | Displayed without any app code | App is started in the background if the OS allows it |
+| Reliability | High priority, shown on arrival | Low priority on iOS, may be delayed or dropped |
+
+Apple treats background pushes as low priority, may throttle them, and recommends sending no more than two or three per hour ([pushing background updates to your app](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app)). On Android, a high-priority FCM message can wake an app out of Doze, and FCM lowers the priority of an app's messages if they do not result in a visible notification ([FCM message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority)).
+
+The stale-comment bug from the opening has two parts. The notification was shown by the OS with no app code involved, so the app's cache was never updated. The tap then opened the photo screen from that cache. Fix both ends: the notification carries a URL that goes through the app's link parser ([navigation](/core-patterns/navigation/)), and the destination screen refetches when opened.
+
+### Receiving in each stack
+
+| Stack | Token | Foreground and tap handling |
+| --- | --- | --- |
+| Android | `FirebaseMessaging.getInstance().token`, `onNewToken` | `FirebaseMessagingService.onMessageReceived`, tap delivers an `Intent` |
+| iOS | `registerForRemoteNotifications`, token in the app delegate | `UNUserNotificationCenterDelegate` methods |
+| React Native | `expo-notifications`: `getDevicePushTokenAsync` or `getExpoPushTokenAsync` | `addNotificationReceivedListener`, `addNotificationResponseReceivedListener` ([expo-notifications](https://docs.expo.dev/versions/latest/sdk/notifications/)) |
+| Flutter | `firebase_messaging`: `getToken`, `onTokenRefresh` | `FirebaseMessaging.onMessage`, `onMessageOpenedApp`, `onBackgroundMessage` ([receive messages in Flutter apps](https://firebase.google.com/docs/cloud-messaging/flutter/receive-messages)) |
+| KMP / CMP | Native code per platform | Native code per platform, forwarding to shared code |
+
+On Android, every notification belongs to a channel that the user can mute individually ([notification channels](https://developer.android.com/develop/ui/views/notifications/channels)). On iOS, a notification service extension can modify a push before it is shown, for example to decrypt it or attach an image ([modifying content in newly delivered notifications](https://developer.apple.com/documentation/usernotifications/modifying-content-in-newly-delivered-notifications)).
+
+## Trade-offs and scale
+
+**Ask for permission at a moment that explains itself.** A permission dialog on first launch is refused by many users, and on iOS the system dialog appears only once. Ask after the user does something that a notification would help with, such as placing an order, and explain the benefit on your own screen first.
+
+**Send fewer notifications.** Users who feel spammed turn off the channel or uninstall. Give each notification type its own channel or category and a setting in the app, and collapse repeats with a thread or collapse key.
+
+**Ongoing activities have their own surfaces.** A delivery in progress or a running timer fits a Live Activity on iOS ([ActivityKit](https://developer.apple.com/documentation/activitykit)) or a Live Update on Android 16 and later ([Live Updates](https://developer.android.com/develop/ui/views/notifications/live-update)). Both can be updated by push.
+
+**Exact timing is a special case.** Android denies the exact alarm permission by default to newly installed apps targeting Android 14, except for clock and calendar apps ([schedule exact alarms are denied by default](https://developer.android.com/about/versions/14/changes/schedule-exact-alarms)). A reminder at a fixed time can use a scheduled local notification, which the OS delivers without running the app.
+
+**Background work needs its own observability.** A job that never runs produces no crash and no bug report. Log each run with its start reason, duration and outcome, send the counts to your analytics and alert when the success rate per app version drops. WorkManager records why the system stopped a worker ([debug WorkManager](https://developer.android.com/develop/background-work/background-tasks/testing/persistent/debug)).
+
+**Test with the system's own triggers.** Waiting for the OS to run a job is not a test plan. Android can force a job with `adb shell cmd jobscheduler run -f <package> <job-id>`. Xcode can launch a registered task from the debugger ([starting and terminating tasks during development](https://developer.apple.com/documentation/backgroundtasks/starting-and-terminating-tasks-during-development)). Both platforms can send a test push from a file: `xcrun simctl push` on a simulator, and the FCM console or API for Android.
+
+<NoDumbQuestions>
+<dt>Can I keep a WebSocket open in the background for instant messages?</dt>
+<dd>No. iOS suspends the app and its sockets. Android would need a foreground service with a permanent notification, and Google Play reviews each declared foreground service type. Messaging apps use high-priority pushes to wake the app and reconnect the socket once it is on screen.</dd>
+
+<dt>What happens to a push when the phone is off?</dt>
+<dd>The push service stores it for a limited time. APNs keeps only the most recent notification per app for an offline device (<a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns">sending notification requests to APNs</a>), and FCM keeps messages for up to four weeks by default (<a href="https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages">FCM message reference, <code>ttl</code></a>). Design for a missed push: sync on app open.</dd>
+
+<dt>Do I need Firebase on iOS?</dt>
+<dd>No. Your backend can talk to APNs directly. Teams use FCM or another provider on iOS to have one API for both platforms, and it forwards to APNs.</dd>
+
+<dt>Is a silent push a reliable way to trigger sync?</dt>
+<dd>It is a useful trigger and an unreliable one. iOS throttles background pushes, does not deliver them to an app the user force-quit, and Low Power Mode delays them. Pair it with a scheduled background task and a sync on open.</dd>
+
+<dt>Why did my periodic job stop running entirely?</dt>
+<dd>Common causes: the user force-stopped the app (Android cancels its jobs until the next manual launch), the app fell into the restricted standby bucket, a manufacturer's battery manager blocked it, or on iOS the user disabled Background App Refresh or has not opened the app for a long time.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Deferrable job | WorkManager | `BGAppRefreshTask`, `BGProcessingTask` | `expo-background-task` | `workmanager` plugin | Native entry point per platform |
+| Grace time after backgrounding | Process usually survives briefly | `beginBackgroundTask` | Host platform's | Host platform's | Host platform's |
+| Long user-started transfer | User-initiated data transfer job | Background `URLSession` | Native transfer module | Native transfer plugin | Per platform |
+| Long user-started processing | Foreground service with a type | `BGContinuedProcessingTask` | Native module | Native plugin | Per platform |
+| Constraints | `Constraints` (network, charging, idle) | `requiresNetworkConnectivity`, `requiresExternalPower` | Passed through to the OS | `Constraints` | Per platform |
+| Told to stop | Coroutine cancelled, `onStopped` | Task cancelled, `expirationHandler` | Task promise abandoned | Isolate stopped | Coroutine cancelled |
+| Push transport | FCM | APNs | FCM and APNs, or Expo push service | FCM and APNs | FCM and APNs |
+| Notification permission | `POST_NOTIFICATIONS` (13+) | `requestAuthorization` | `requestPermissionsAsync` | `requestPermission` | Per platform |
+| User-facing grouping | Notification channels | Categories, threads | Channels and categories | Channels and categories | Per platform |
+| Ongoing status | Live Updates (16+) | Live Activities | Native module or config plugin | Native plugin | Per platform |
+| Local scheduled notification | `AlarmManager` + notification | `UNCalendarNotificationTrigger` | `scheduleNotificationAsync` | `flutter_local_notifications` | Per platform |
+
+<Exercise>
+Pick the mechanism for each feature and name one thing that can stop it from working.
+
+1. A podcast app downloads new episodes overnight.
+2. A chat app shows "Anna: are you coming?" within seconds.
+3. A fitness app records a run with GPS for two hours while the screen is off.
+4. A notes app sends the edit a user made just before pressing the home button.
+5. A medication app reminds the user at 08:00 every day.
+
+<Fragment slot="answer">
+1. A deferrable job with constraints (unmetered network, charging): WorkManager or `BGProcessingTask`, with the downloads themselves in a background transfer. An app the user rarely opens gets few or no runs.
+2. A visible push through FCM and APNs, with the message text in the payload or fetched by a notification service extension. It fails if the token is stale, notifications are disabled, or a manufacturer's battery manager blocks delivery.
+3. Ongoing visible work: a foreground service of type `location` on Android, and the location background mode on iOS. It needs location permission that covers background use, and the user can revoke it.
+4. The grace period after backgrounding is enough for one small request, with the edit already saved locally and queued in the outbox. If the request does not finish, the next sync sends it.
+5. A scheduled local notification with a daily calendar trigger. No background execution is involved. On Android, exact timing needs the exact alarm permission, and without it the reminder can arrive late. Disabled notifications stop it on both platforms.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** has no cross-platform scheduler. Apps write platform code against WorkManager and BackgroundTasks, and use Firebase or Azure Notification Hubs for push.
+- **Ionic / Capacitor** uses the Push Notifications plugin for FCM and APNs and a Background Runner plugin that executes a small JavaScript file under the same OS limits.
+- **Lynx** relies on the host app's native code for scheduling and push.
+
+## Sources
+
+- Android: [Background tasks overview](https://developer.android.com/develop/background-work/background-tasks), [WorkManager](https://developer.android.com/develop/background-work/background-tasks/persistent/getting-started), [WorkManager releases](https://developer.android.com/jetpack/androidx/releases/work) (2.12), [User-initiated data transfer](https://developer.android.com/develop/background-work/background-tasks/uidt), [Foreground service types](https://developer.android.com/develop/background-work/services/fgs/service-types), [Foreground service timeouts](https://developer.android.com/develop/background-work/services/fgs/timeout), [Doze and App Standby](https://developer.android.com/training/monitoring-device-state/doze-standby), [App Standby Buckets](https://developer.android.com/topic/performance/appstandby), [Notification permission](https://developer.android.com/develop/ui/views/notifications/notification-permission), [Notification channels](https://developer.android.com/develop/ui/views/notifications/channels), [Live Updates](https://developer.android.com/develop/ui/views/notifications/live-update), [Exact alarms denied by default](https://developer.android.com/about/versions/14/changes/schedule-exact-alarms)
+- iOS: [BGTaskScheduler](https://developer.apple.com/documentation/backgroundtasks/bgtaskscheduler), [Using background tasks to update your app](https://developer.apple.com/documentation/uikit/using-background-tasks-to-update-your-app), [backgroundTask modifier](https://developer.apple.com/documentation/swiftui/scene/backgroundtask(_:action:)), [Downloading files in the background](https://developer.apple.com/documentation/foundation/downloading-files-in-the-background), [WWDC25: Finish tasks in the background](https://developer.apple.com/videos/play/wwdc2025/227/), [Sending notification requests to APNs](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns), [Pushing background updates to your app](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app), [ActivityKit](https://developer.apple.com/documentation/activitykit)
+- Push services: [FCM message reference](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages), [FCM architecture](https://firebase.google.com/docs/cloud-messaging/fcm-architecture), [FCM message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority), [Manage FCM registration tokens](https://firebase.google.com/docs/cloud-messaging/manage-tokens)
+- React Native: [expo-background-task](https://docs.expo.dev/versions/latest/sdk/background-task/), [expo-notifications](https://docs.expo.dev/versions/latest/sdk/notifications/), [Expo push notifications overview](https://docs.expo.dev/push-notifications/overview/), [Headless JS](https://reactnative.dev/docs/headless-js-android)
+- Flutter: [Background processes](https://docs.flutter.dev/packages-and-plugins/background-processes), [workmanager](https://pub.dev/packages/workmanager) (0.10), [Receive messages in Flutter apps](https://firebase.google.com/docs/cloud-messaging/flutter/receive-messages)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 5 (push and background notifications)
