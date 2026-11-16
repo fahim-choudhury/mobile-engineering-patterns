@@ -45,3 +45,7 @@ Write internal links root-relative, for example `/core-patterns/navigation/`. Th
 ## Deployment
 
 `.github/workflows/deploy.yml` builds the site on every push and pull request. Pushes to `main` deploy to GitHub Pages.
+
+## License
+
+Copyright 2026 Fahim Masud Choudhury. Licensed under [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). You can share and adapt the book, commercially too, as long as you credit the author and link to the license. The full text is in [`LICENSE`](LICENSE).
