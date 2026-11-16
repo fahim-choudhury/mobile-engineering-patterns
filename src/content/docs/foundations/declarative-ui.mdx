@@ -1,0 +1,409 @@
+---
+title: Rendering models and declarative UI
+description: How Compose, SwiftUI, React and Flutter turn state into UI, what re-runs when state changes, and why identity and keys decide whether your app keeps its state.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+Picture an Android screen from 2016. A cart badge shows "3". The user removes an item, and your click handler updates the list adapter, the total price `TextView` and the checkout button. It forgets the badge. Now the screen says "3" while the list shows two items, and a QA engineer files a bug that takes you twenty minutes to reproduce.
+
+Every bug like that has the same cause: the screen and your data are two separate copies of the truth, and you wrote code to keep them in sync by hand. Declarative UI removes the second copy. React Native (2015), Flutter (2018), SwiftUI (2019) and Jetpack Compose (2021) all made that move.
+
+<BrainPower>
+In Compose, SwiftUI, React Native and Flutter you never call `setText()` or assign `label.text`. So when `count` goes from 3 to 4, how does the number on screen change? Who decides which parts of the screen to touch? The answer is at the end of the "Persistence" section.
+</BrainPower>
+
+## Constraints on a phone
+
+The cart bug can happen on any UI platform. A phone adds constraints that make hand-written sync code harder to get right:
+
+- **The OS destroys and rebuilds your UI.** Android recreates the `Activity`, and the UI with it, on every configuration change such as a rotation ([docs](https://developer.android.com/guide/topics/resources/runtime-changes)). It can also kill an app's process to reclaim memory ([docs](https://developer.android.com/guide/components/activities/process-lifecycle)). View objects don't survive either event, so they can't hold the only copy of anything. The [app lifecycle](/foundations/app-lifecycle/) chapter covers both.
+- **Every update has a frame deadline.** Android asks for a frame in under 16 ms at 60 fps and 8 ms at 120 fps ([docs](https://developer.android.com/topic/performance/vitals/render)). Apple describes the same deadline for SwiftUI: a view update that isn't ready for the next frame shows up as a hitch ([docs](https://developer.apple.com/documentation/xcode/understanding-and-improving-swiftui-performance)).
+
+The screen has to be rebuildable from state at any moment, and rebuilding has to be cheap. Declarative UI is designed around both.
+
+## From "change the screen" to "describe the screen"
+
+In the **imperative** model you hold references to UI objects and mutate them: `findViewById`, `textView.setText`, `label.isHidden = true`. Every event handler must know every view that depends on the data it changed.
+
+In the **declarative** model you write a function from state to UI. When state changes, the framework calls your function again and works out what to change on screen. You never touch a view object.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  state: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  good: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  group: { style: { font-size: 18 } }
+}
+grid-columns: 2
+grid-gap: 40
+imp: "Imperative" {
+  class: group
+  grid-rows: 3
+  vertical-gap: 30
+  ev: "Remove item tapped" { class: box }
+  handler: "Click handler" { class: state }
+  views: "list.update()\ntotal.setText()\nbutton.isEnabled\nbadge.setText()  <- forgotten" { class: bad }
+  ev -> handler -> views
+}
+dec: "Declarative" {
+  class: group
+  grid-rows: 3
+  vertical-gap: 30
+  ev: "Remove item tapped" { class: box }
+  st: "cart = cart - item" { class: state }
+  ui: "UI = f(cart)\nframework re-runs f\nand updates the screen" { class: good }
+  ev -> st -> ui
+}
+```
+
+The idea is often written as **UI = f(state)**. Your job shrinks to keeping the state correct and writing `f`.
+
+<Aside type="caution" title="Watch it!">
+"Declarative" does not mean the old toolkits are gone. Android Views and UIKit still power large parts of production apps, every `RecyclerView` adapter and `UITableViewDataSource` you meet is imperative, and both Compose and SwiftUI interoperate with them (`AndroidView`, `ComposeView`, `UIViewRepresentable`, `UIHostingController`). Expect to cross that boundary in any app older than a few years.
+</Aside>
+
+## The same counter in every stack
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Composable
+fun Counter() {
+    var count by remember { mutableIntStateOf(0) }
+    Button(onClick = { count++ }) {
+        Text("Tapped $count times")
+    }
+}
+```
+`mutableIntStateOf` creates a snapshot state object. Compose records which composables **read** it, and re-runs only those when it changes. `remember` keeps the value across re-runs.
+</TabItem>
+<TabItem label="iOS">
+```swift
+struct Counter: View {
+    @State private var count = 0
+
+    var body: some View {
+        Button("Tapped \(count) times") { count += 1 }
+    }
+}
+```
+`Counter` is a struct, a cheap value that SwiftUI creates and throws away constantly. `@State` stores `count` outside the struct, in storage SwiftUI keeps for this view's identity. Changing it makes SwiftUI evaluate `body` again.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+  return (
+    <Pressable onPress={() => setCount(c => c + 1)}>
+      <Text>Tapped {count} times</Text>
+    </Pressable>
+  );
+}
+```
+Calling `setCount` schedules a re-render of `Counter`. React calls the function again, compares the new element tree with the old one and hands the differences to Fabric, which updates the native views.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+class Counter extends StatefulWidget {
+  const Counter({super.key});
+  @override
+  State<Counter> createState() => _CounterState();
+}
+
+class _CounterState extends State<Counter> {
+  int count = 0;
+
+  @override
+  Widget build(BuildContext context) => TextButton(
+        onPressed: () => setState(() => count++),
+        child: Text('Tapped $count times'),
+      );
+}
+```
+The widget is immutable configuration. The `State` object lives on between builds and holds `count`. `setState` marks this element dirty, and Flutter calls `build` again on the next frame.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: identical to Jetpack Compose.
+@Composable
+fun Counter() {
+    var count by remember { mutableIntStateOf(0) }
+    Button(onClick = { count++ }) {
+        Text("Tapped $count times")
+    }
+}
+```
+Compose Multiplatform uses the same runtime and compiler plugin as Jetpack Compose, so everything in the Android tab applies on iOS too. With KMP but native UI, the iOS side is SwiftUI as in the iOS tab.
+</TabItem>
+</Tabs>
+
+Every version has a piece of state, a function that reads it and an event that changes it.
+
+## The update loop
+
+Every framework runs the same loop. The details differ in the "re-run" and "compare" steps.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  hot: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 4
+grid-columns: 2
+horizontal-gap: 80
+vertical-gap: 40
+a: "1. Event\n(tap, network, timer)" { class: box }
+b: "2. State changes" { class: box }
+d: "4. Re-run UI functions\nfor those parts" { class: hot }
+c: "3. Framework marks\naffected parts invalid" { class: hot }
+e: "5. Compare with previous\nresult, apply changes" { class: hot }
+f: "6. Layout" { class: box }
+h: "8. Frame on screen" { class: box }
+g: "7. Draw" { class: box }
+a -> b -> c -> d
+d -> e
+e -> f -> g -> h
+```
+
+Steps 3 to 5, in blue, are where the frameworks differ. In Compose and Flutter, steps 4 to 7 run inside one frame and share the frame deadline from the start of this chapter: composition, layout and drawing are the phases of a Compose frame ([Compose phases](https://developer.android.com/develop/ui/compose/phases)), and Flutter runs build, layout and paint before it hands the scene to the engine ([architectural overview](https://docs.flutter.dev/resources/architectural-overview)). SwiftUI view updates have to finish before the next frame too ([Apple](https://developer.apple.com/documentation/xcode/understanding-and-improving-swiftui-performance)). React Native differs: render and layout run on the JavaScript thread ([threading model](https://reactnative.dev/architecture/threading-model)), so a slow render delays the update while a native `ScrollView` keeps scrolling on the UI thread ([docs: performance](https://reactnative.dev/docs/performance)).
+
+## Granularity, identity and persistence
+
+Every declarative framework has to answer these questions, and each stack's answers explain most of its performance advice:
+
+1. **Granularity**: when state changes, what code re-runs?
+2. **Identity**: how does the framework match the new description to what is already on screen?
+3. **Persistence**: where does state live, given that the UI function runs again and again?
+
+### Granularity
+
+Take this screen. The tap count lives at the top, but only the header shows it.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  owner: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  reader: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+screen: "CartScreen\nholds count" { class: owner }
+header: "Header\nshows count" { class: reader }
+list: "ProductList\n200 rows" { class: box }
+footer: "Footer" { class: box }
+screen -> header
+screen -> list
+screen -> footer
+```
+
+| Stack | What re-runs when `count` changes |
+| --- | --- |
+| Compose | Only the composable scopes that **read** `count`. Children whose parameters are unchanged are skipped. With strong skipping, on by default since Kotlin 2.0.20, that includes children with unstable parameters when the same instances are passed ([docs](https://developer.android.com/develop/ui/compose/performance/stability/strongskipping)). |
+| SwiftUI | Views whose `body` read `count`. With the `@Observable` macro (iOS 17+), SwiftUI tracks reads per property, so a view that never reads `count` is not invalidated ([Apple migration guide](https://developer.apple.com/documentation/swiftui/migrating-from-the-observable-object-protocol-to-the-observable-macro)). |
+| React (RN) | `CartScreen` and, by default, **every component under it**, including the 200-row list. `memo`, `useMemo` and `useCallback` let React skip unchanged subtrees. React Compiler 1.0 adds that memoization automatically at build time ([React blog](https://react.dev/blog/2025/10/07/react-compiler-1)). |
+| Flutter | `CartScreen`'s `build` and all descendants it creates. The rebuild stops at a child widget that is the **same instance** as last frame, which is why `const` widgets are cheap ([docs](https://docs.flutter.dev/perf/best-practices)). |
+
+So the same advice shows up in every stack's docs: **keep state as close as possible to where it is read.** Flutter's docs say to call `setState` low in the tree ([docs](https://docs.flutter.dev/perf/best-practices)). React's say to prefer local state and not lift it higher than necessary ([docs](https://react.dev/reference/react/memo)). Compose's say to defer state reads, for example reading a scroll offset inside a `Modifier.offset { }` lambda so only layout re-runs ([docs](https://developer.android.com/develop/ui/compose/performance/bestpractices)). Apple's performance guide says to narrow an update by moving views whose state doesn't affect layout into a separate view hierarchy ([docs](https://developer.apple.com/documentation/xcode/understanding-and-improving-swiftui-performance)).
+
+<Aside type="caution" title="Watch it!">
+Older SwiftUI code uses `ObservableObject` with `@Published` properties. Any `@Published` change invalidates **every** view observing that object, even views that never read the changed property ([Apple migration guide](https://developer.apple.com/documentation/swiftui/migrating-from-the-observable-object-protocol-to-the-observable-macro)). If a SwiftUI screen re-renders too much, check whether it is still on `ObservableObject`.
+</Aside>
+
+### Identity
+
+After re-running your function, the framework has a new description and an existing UI. It must decide, element by element, "is this the same thing as before, updated, or a new thing?" That decision is **identity**, and it controls whether state survives.
+
+Every stack uses the same default: **position in the tree**. The first child of a column stays the first child. Each also lets you override it with an explicit **key**:
+
+| Stack | Default identity | Explicit identity |
+| --- | --- | --- |
+| Compose | Call-site position in the composition ("positional memoization") | `key(id) { }`, `items(list, key = { it.id })` |
+| SwiftUI | "Structural identity": type and position, `if`/`else` branches are different identities | `.id(value)`, `ForEach(items, id: \.id)` or `Identifiable` |
+| React | Component type and position in the tree | `key` prop |
+| Flutter | Widget type and position (`runtimeType` and slot) | `Key`: `ValueKey`, `ObjectKey`, `GlobalKey` |
+
+Keys have consequences in everyday code:
+
+- **Changing a key resets state.** React's docs recommend this to reset a form: render it with `key={userId}` and switching users gives a fresh form ([React docs](https://react.dev/learn/preserving-and-resetting-state)). `.id()` in SwiftUI and `key()` in Compose do the same.
+- **Bad keys move state to the wrong row.** Using the list index as a key ties state to the position, not the item:
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 4
+grid-columns: 3
+grid-gap: 16
+h0: "Step" { class: head }
+h1: "key = index" { class: head }
+h2: "key = item.id" { class: head }
+r1: "Before: [A, B*, C]\n(* = expanded)" { class: box }
+r1a: "0:A  1:B*  2:C" { class: box }
+r1b: "A  B*  C" { class: box }
+r2: "Delete A" { class: box }
+r2a: "0:B  1:C*\nC looks expanded" { class: bad }
+r2b: "B*  C\nB stays expanded" { class: ok }
+r3: "Why" { class: box }
+r3a: "state was stored\nfor slot 1" { class: bad }
+r3b: "state was stored\nfor item B" { class: ok }
+```
+
+### Persistence
+
+The UI function runs many times, so a local variable inside it would reset on every run. Each framework stores state **outside** the function, attached to the identity from the previous section:
+
+- **Compose**: `remember` stores values in the composition, keyed by call-site position, and forgets them when the composable leaves the composition. `rememberSaveable` also survives activity recreation and system-initiated process death ([docs](https://developer.android.com/develop/ui/compose/state)).
+- **SwiftUI**: SwiftUI manages the storage behind `@State` ([docs](https://developer.apple.com/documentation/swiftui/state)). The storage lasts as long as the view's identity, not the struct ([Demystify SwiftUI](https://developer.apple.com/videos/play/wwdc2021/10022/)).
+- **React**: state belongs to the component at that position in the tree ([docs](https://react.dev/learn/preserving-and-resetting-state)). Inside a component, React matches each Hook to its state by call order, which is why you can't call Hooks conditionally ([docs](https://react.dev/learn/state-a-components-memory)).
+- **Flutter**: the `State` object belongs to the **element**, the long-lived node the framework keeps while widgets are rebuilt. When a widget is replaced by one with the same type and key, the framework keeps the `State` and points it at the new widget ([docs](https://api.flutter.dev/flutter/widgets/State-class.html)).
+
+When identity changes, state is discarded. Answer to the Brain Power question: the framework re-runs the functions that depend on `count`, compares the result with the previous one using identity, and updates only what changed.
+
+## Trees under the hood
+
+Your UI functions produce cheap, short-lived descriptions. Each framework keeps longer-lived structures behind them:
+
+```d2
+classes: {
+  short: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  long: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+  out: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 5
+grid-columns: 4
+grid-gap: 12
+h0: "Stack" { class: head }
+h1: "You write\n(rebuilt often)" { class: head }
+h2: "Framework keeps\n(identity + state)" { class: head }
+h3: "Laid out and drawn" { class: head }
+c0: "Compose" { class: head }
+c1: "@Composable calls" { class: short }
+c2: "Composition\n(slot table)" { class: long }
+c3: "LayoutNode tree" { class: out }
+s0: "SwiftUI" { class: head }
+s1: "View structs" { class: short }
+s2: "Attribute graph\n(private)" { class: long }
+s3: "Core Animation\nlayers" { class: out }
+r0: "React Native" { class: head }
+r1: "React elements" { class: short }
+r2: "Fibers +\nC++ shadow tree" { class: long }
+r3: "Native views" { class: out }
+f0: "Flutter" { class: head }
+f1: "Widgets" { class: short }
+f2: "Elements" { class: long }
+f3: "RenderObjects" { class: out }
+```
+
+Flutter documents this most openly. Widgets are immutable configuration, **elements** hold the structure and the `State` objects, and **render objects** do layout, painting and hit testing ([Inside Flutter](https://docs.flutter.dev/resources/inside-flutter)). React keeps a fiber per component instance, and React Native adds the C++ shadow tree from the [runtime anatomy](/foundations/runtime-anatomy/) chapter. SwiftUI keeps a dependency graph it does not expose: nodes are views, edges are their inputs, and SwiftUI walks it to decide what to update.
+
+You rarely touch these structures directly. They matter because they explain the rule in every framework's docs: **creating descriptions is cheap, creating the long-lived nodes is not.** Re-running `body` 100 times costs little. Destroying and recreating an element because its identity changed costs a lot, and loses its state.
+
+## Phases of a frame
+
+Every stack splits a frame into "describe", "measure and place" and "draw", in that order and under different names.
+
+| Stack | Describe | Measure and place | Draw |
+| --- | --- | --- | --- |
+| Compose | Composition | Layout (measure, place) | Drawing |
+| SwiftUI | `body` evaluation | Layout (`Layout` protocol for custom layouts) | Core Animation render |
+| React Native | Render (JS thread) | Commit with Yoga Flexbox layout | Mount to native views, platform draws them |
+| Flutter | Build | Layout | Paint, then raster thread with Impeller |
+
+Compose lets you choose the phase a state read happens in ([Compose phases](https://developer.android.com/develop/ui/compose/phases)). A read inside a composable body triggers recomposition. A read inside a `Modifier.offset { }` or `drawBehind { }` lambda only re-runs layout or drawing. For a value that changes every frame, such as a scroll position or an animation, that is the difference between smooth and janky.
+
+## Lists and virtualization
+
+A list of 10,000 items cannot have 10,000 live UI nodes. Every stack solves this with **virtualization**: only build items near the viewport.
+
+| Stack | Virtualized list | Notes |
+| --- | --- | --- |
+| Compose | `LazyColumn`, `LazyRow`, `LazyVerticalGrid` | Pass `key` so items keep state when the list changes ([docs](https://developer.android.com/develop/ui/compose/lists)) |
+| SwiftUI | `List`, `LazyVStack`, `LazyVGrid` | `ForEach` needs `Identifiable` elements or an `id` ([docs](https://developer.apple.com/documentation/swiftui/foreach)); plain `VStack` loads every child at once ([docs](https://developer.apple.com/documentation/swiftui/creating-performant-scrollable-stacks)) |
+| React Native | `FlatList`, Shopify `FlashList` | FlashList **recycles** item components; v2 needs the New Architecture ([migration guide](https://shopify.github.io/flash-list/docs/v2-migration/)) |
+| Flutter | `ListView.builder`, `SliverList` in a `CustomScrollView` | `ListView(children: [...])` creates every child widget up front, though elements and render objects are still created lazily ([docs](https://api.flutter.dev/flutter/widgets/ListView-class.html)) |
+
+<Aside type="caution" title="Watch it!">
+Recycling lists reuse a component instance for a different item. Local state in a recycled item can show values from the item it displayed before. FlashList provides `useRecyclingState` to reset state when the item changes ([FlashList docs](https://shopify.github.io/flash-list/docs/recycling/)). Android developers know this bug from `RecyclerView` view holders.
+</Aside>
+
+## Trade-offs and scale
+
+The framework now decides when your UI code runs, so you can't find a slow update by reading a click handler. Each stack ships a tool that shows what re-ran:
+
+| Stack | Tool | Output |
+| --- | --- | --- |
+| Compose | Layout Inspector in Android Studio | Recomposition and skip counts per composable ([docs](https://developer.android.com/develop/ui/compose/tooling/debug)) |
+| SwiftUI | SwiftUI template in Instruments | View bodies that run long or update too often, and hitches ([docs](https://developer.apple.com/documentation/xcode/understanding-and-improving-swiftui-performance)) |
+| React Native | React Native DevTools | Highlights components as they re-render, and the Profiler records render timing ([docs](https://reactnative.dev/docs/react-native-devtools)) |
+| Flutter | Flutter DevTools performance view | "Track Widget Builds" adds each `build()` call to the frame timeline ([docs](https://docs.flutter.dev/tools/devtools/performance)) |
+
+Local state and keys handle state that one screen owns. Once several screens share data, that state moves out of the UI tree into a store or view model, which the state management chapter covers. In an app that mixes old and new UI, every screen that crosses the interop boundary from the first "Watch it!" box has both models in it: imperative code inside the wrapped view and declarative code around it.
+
+<NoDumbQuestions>
+<dt>Isn't re-running my UI function on every change slow?</dt>
+<dd>Creating descriptions is cheap, and every framework skips work it can prove is unnecessary. Slowness comes from expensive work inside the function (sorting a list, formatting dates, allocating objects) and from re-running far more than needed. Move computation out of the UI function and keep state close to where it is read.</dd>
+
+<dt>Do I still need `useMemo` and `useCallback` with React Compiler?</dt>
+<dd>Mostly no. The compiler adds memoization automatically when your code follows the Rules of React. You still need to understand memoization to read existing code and to debug the cases the compiler skips.</dd>
+
+<dt>Is Compose's "stability" the same as React's memoization?</dt>
+<dd>The goal is the same and the mechanism differs. React compares props when a component is memoized. Compose's compiler generates the comparison for every skippable composable and uses stability to choose between `equals()` and instance equality.</dd>
+
+<dt>Is SwiftUI built on UIKit?</dt>
+<dd>SwiftUI apps run inside UIKit's app and scene machinery, and some SwiftUI controls are backed by UIKit internally. Apple treats the mapping as an implementation detail that changes between releases, so don't build on assumptions about it.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android (Compose) | iOS (SwiftUI) | React Native | Flutter |
+| --- | --- | --- | --- | --- |
+| UI unit | `@Composable` function | `View` struct | Function component | `Widget` class |
+| Local state | `remember { mutableStateOf() }` | `@State` | `useState` | `State` + `setState` |
+| Observable model | `StateFlow` / snapshot state | `@Observable` class | Store or context (Zustand, Redux) | `ChangeNotifier`, Riverpod, Bloc |
+| Re-run unit | Recompose scope | View `body` | Component render | `build` method |
+| Skip unchanged work | Stability + strong skipping | Per-property observation | `memo`, React Compiler | `const`, same widget instance |
+| Explicit identity | `key()` | `.id()` | `key` | `Key` |
+| Virtualized list | `LazyColumn` | `List`, `LazyVStack` | `FlatList`, `FlashList` | `ListView.builder` |
+| Imperative fallback | `AndroidView` | `UIViewRepresentable` | Native component | Platform view |
+
+Compose Multiplatform uses the Android column everywhere.
+
+<Exercise>
+A to-do app shows a list of tasks. Each row has a text field for editing its title, holding the draft text in local state. A user starts editing the third task, then a background sync inserts a new task at the top of the list. The draft text stays on the **third** row, which now shows a different task.
+
+1. What went wrong, in one sentence that applies to every stack?
+2. Write the fix in the stack you know best.
+
+<Fragment slot="answer">
+1. The rows are identified by position (an index key, or no key at all), so the draft state stayed in slot 3 while the tasks moved down one slot.
+2. Give each row a stable identity from the data:
+   - Compose: `items(tasks, key = { it.id }) { TaskRow(it) }`
+   - SwiftUI: `ForEach(tasks) { TaskRow(task: $0) }` with an `Identifiable` model. Name the model `TodoItem`, because `Task` already belongs to Swift Concurrency ([docs](https://developer.apple.com/documentation/swift/task)).
+   - React Native: `<FlatList data={tasks} keyExtractor={t => t.id} ... />`
+   - Flutter: `TaskRow(key: ValueKey(task.id), task: task)` inside `ListView.builder`, plus a `findChildIndexCallback` that maps a key to the row's new index. Without the callback the row's `State` can be lost when the order changes ([docs](https://api.flutter.dev/flutter/widgets/SliverChildBuilderDelegate/findChildIndexCallback.html)).
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** is XAML plus MVVM data binding by default: declarative markup, but the binding engine updates individual control properties rather than re-running a UI function.
+- **Ionic / Capacitor** uses whatever web framework you choose (Angular, React, Vue), so the React column above applies to React-based Ionic apps, rendering into the DOM.
+
+## Sources
+
+- Android: [Configuration changes](https://developer.android.com/guide/topics/resources/runtime-changes), [Processes and app lifecycle](https://developer.android.com/guide/components/activities/process-lifecycle), [Slow rendering](https://developer.android.com/topic/performance/vitals/render)
+- Compose: [Phases](https://developer.android.com/develop/ui/compose/phases), [State](https://developer.android.com/develop/ui/compose/state), [Lists and grids](https://developer.android.com/develop/ui/compose/lists), [Stability](https://developer.android.com/develop/ui/compose/performance/stability), [Strong skipping](https://developer.android.com/develop/ui/compose/performance/stability/strongskipping), [Performance best practices](https://developer.android.com/develop/ui/compose/performance/bestpractices), [Debugging tools](https://developer.android.com/develop/ui/compose/tooling/debug)
+- SwiftUI: [Demystify SwiftUI (WWDC21)](https://developer.apple.com/videos/play/wwdc2021/10022/), [State](https://developer.apple.com/documentation/swiftui/state), [ForEach](https://developer.apple.com/documentation/swiftui/foreach), [Migrating to the Observable macro](https://developer.apple.com/documentation/swiftui/migrating-from-the-observable-object-protocol-to-the-observable-macro), [Creating performant scrollable stacks](https://developer.apple.com/documentation/swiftui/creating-performant-scrollable-stacks), [Understanding and improving SwiftUI performance](https://developer.apple.com/documentation/xcode/understanding-and-improving-swiftui-performance)
+- React: [State: a component's memory](https://react.dev/learn/state-a-components-memory), [Preserving and resetting state](https://react.dev/learn/preserving-and-resetting-state), [memo](https://react.dev/reference/react/memo), [React Compiler 1.0](https://react.dev/blog/2025/10/07/react-compiler-1), [React Compiler in Expo](https://docs.expo.dev/guides/react-compiler/)
+- React Native: [Threading model](https://reactnative.dev/architecture/threading-model), [Performance overview](https://reactnative.dev/docs/performance), [React Native DevTools](https://reactnative.dev/docs/react-native-devtools), [FlashList v2 migration](https://shopify.github.io/flash-list/docs/v2-migration/), [FlashList recycling](https://shopify.github.io/flash-list/docs/recycling/)
+- Flutter: [Inside Flutter](https://docs.flutter.dev/resources/inside-flutter), [Architectural overview](https://docs.flutter.dev/resources/architectural-overview), [Performance best practices](https://docs.flutter.dev/perf/best-practices), [State class](https://api.flutter.dev/flutter/widgets/State-class.html), [ListView class](https://api.flutter.dev/flutter/widgets/ListView-class.html), [findChildIndexCallback](https://api.flutter.dev/flutter/widgets/SliverChildBuilderDelegate/findChildIndexCallback.html), [DevTools performance view](https://docs.flutter.dev/tools/devtools/performance)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 1 (state management) and ch. 14 (application state and event-driven changes)

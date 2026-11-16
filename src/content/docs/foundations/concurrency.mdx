@@ -1,0 +1,396 @@
+---
+title: Concurrency and threading
+description: How each stack keeps slow work off the thread that draws the UI, with coroutines, Swift Concurrency, the JavaScript event loop and Dart isolates, and how cancellation and shared state work in each.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A product search screen ships with these bug reports in its first week:
+
+- Typing stutters, because every keystroke filters 20,000 products before the next frame can draw.
+- A user types "sho" and sees results for "sh". The request for "sh" was slower and its response arrived last.
+- A user leaves the screen during a search, and the response updates a screen that no longer exists.
+
+The first bug blocks the UI thread, the second is a race, and the third is a missing cancellation. Every stack in this book has tools for all of them, under different names.
+
+<BrainPower>
+A button handler runs `await parseCatalog(text)`. `parseCatalog` is declared `async` (or `suspend` in Kotlin), and its body is a plain loop that takes 300 ms. In which of Kotlin, Swift, JavaScript and Dart does the UI stay responsive during those 300 ms? The answer is at the end of the "Load, parse, show" section.
+</BrainPower>
+
+## One thread draws the UI
+
+Every stack has one thread that handles input, runs your UI code and produces frames: the main thread on Android and iOS, the JavaScript thread plus the UI thread in React Native, the main isolate in Flutter ([runtime anatomy](/foundations/runtime-anatomy/)). A frame has 16.7 ms at 60 Hz and 8.3 ms at 120 Hz. Whatever runs on that thread shares the budget.
+
+The platforms respond to a blocked UI thread in stages:
+
+```d2
+classes: {
+  warn: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 2
+grid-columns: 4
+grid-gap: 12
+t1: "Over one frame\n(8 to 16 ms)" { class: head }
+t2: "Over 250 ms" { class: head }
+t3: "Over 5 s\n(Android)" { class: head }
+t4: "Too long\n(iOS)" { class: head }
+c1: "Dropped frame:\nscrolling stutters" { class: warn }
+c2: "Hang: taps feel\nignored" { class: warn }
+c3: "ANR dialog:\n\"App isn't\nresponding\"" { class: bad }
+c4: "Watchdog kills\nthe app\n(0x8badf00d)" { class: bad }
+```
+
+Apple's tools report a hang when the main thread is unavailable for 250 ms or more ([WWDC22: Track down hangs](https://developer.apple.com/videos/play/wwdc2022/10082/)), and the watchdog terminates apps that block it for much longer, most often during launch ([Addressing watchdog terminations](https://developer.apple.com/documentation/xcode/addressing-watchdog-terminations)). Android raises an ANR when an app has not responded to an input event within 5 seconds ([ANRs](https://developer.android.com/topic/performance/issues/anr)). Cross-platform apps inherit both, because their code runs inside a native app.
+
+## Waiting and working are different problems
+
+Slow operations come in two kinds, and they need different fixes.
+
+- **I/O-bound** work waits for something else: a server, a disk, a database. The thread has nothing to do in the meantime.
+- **CPU-bound** work computes: parsing, sorting, image decoding, encryption. The thread is busy the whole time.
+
+`async`/`await` (and `suspend` in Kotlin) solves the first kind. At an `await`, the function pauses and gives the thread back, so frames keep drawing while the request is in flight. It does nothing for the second kind. A CPU-bound loop inside an `async` function still occupies whichever thread it runs on.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 4
+grid-columns: 5
+grid-gap: 12
+h0: "UI thread" { class: head }
+h1: "Frame 1" { class: head }
+h2: "Frame 2" { class: head }
+h3: "Frame 3" { class: head }
+h4: "Frame 4" { class: head }
+a0: "await a\nnetwork call" { class: box }
+a1: "send request,\ndraw" { class: ok }
+a2: "draw" { class: ok }
+a3: "draw" { class: ok }
+a4: "result arrives,\ndraw" { class: ok }
+b0: "await parse()\non the UI thread" { class: box }
+b1: "parse" { class: bad }
+b2: "parse" { class: bad }
+b3: "parse" { class: bad }
+b4: "draw, three\nframes late" { class: bad }
+c0: "await parse()\non a worker" { class: box }
+c1: "hand off,\ndraw" { class: ok }
+c2: "draw" { class: ok }
+c3: "draw" { class: ok }
+c4: "result arrives,\ndraw" { class: ok }
+```
+
+## The pattern
+
+1. **UI state belongs to one thread.** Only the UI thread reads and writes what the screen shows. Other threads hand results over.
+2. **Suspend, don't block.** Waiting is written with `await` so the thread is free while nothing is happening.
+3. **Move CPU work off explicitly.** Each stack has one construct that says "run this somewhere else and resume me with the result".
+4. **Start work in a scope that can cancel it.** Work belongs to a screen or a view model. When the owner goes away, its work is cancelled, including any child work it started. This is called structured concurrency.
+5. **Pass values, not shared objects.** Results cross threads as immutable data or messages.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  owner: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  work: { style: { fill: "#D6E8FF"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+direction: down
+screen: "Screen scope\ncancelled when the screen closes" { class: owner }
+load: "load()" { class: work }
+search: "search(query)" { class: work }
+fetch: "fetch\n(waits on network)" { class: box }
+parse: "parse\n(on a worker)" { class: box }
+screen -> load
+screen -> search
+load -> fetch
+load -> parse
+```
+
+Cancelling a scope cancels everything below it.
+
+## Load, parse, show
+
+The same job in each stack: fetch a product list, parse it off the UI thread, show it, and stop if the screen closes.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+class SearchViewModel(private val api: Api) : ViewModel() {
+    private val _items = MutableStateFlow<List<Product>>(emptyList())
+    val items = _items.asStateFlow()
+
+    fun load() {
+        // Starts on the main thread. Cancelled with the ViewModel.
+        viewModelScope.launch {
+            val body = api.fetchProducts()   // suspends, main thread is free
+            _items.value = withContext(Dispatchers.Default) {
+                parseProducts(body)          // CPU work on the shared pool
+            }
+        }
+    }
+}
+```
+`suspend` does not choose a thread. A coroutine runs on its dispatcher, and `viewModelScope` uses the main one ([lifecycle-aware coroutines](https://developer.android.com/topic/libraries/architecture/coroutines)). `withContext` switches for one block and switches back. `Dispatchers.Default` has as many threads as CPU cores and is for computation. `Dispatchers.IO` is for calls that block a thread, with up to 64 threads ([kotlinx.coroutines API](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-dispatchers/-i-o.html)). In the UI, collect with `collectAsStateWithLifecycle()`, which stops collecting when the app is stopped.
+</TabItem>
+<TabItem label="iOS">
+```swift
+@MainActor @Observable
+final class SearchModel {
+    var items: [Product] = []
+
+    func load() async throws {
+        // Suspends. The main actor is free while the request runs.
+        let (data, _) = try await URLSession.shared.data(from: url)
+        // Parses elsewhere, then resumes here on the main actor.
+        items = try await parseProducts(data)
+    }
+}
+
+@concurrent  // runs off the main actor
+func parseProducts(_ data: Data) async throws -> [Product] {
+    try JSONDecoder().decode([Product].self, from: data)
+}
+
+// In the view. SwiftUI cancels the task when the view disappears.
+List(model.items) { ProductRow(product: $0) }
+    .task { try? await model.load() }
+```
+`@MainActor` puts the model on the main thread, and the compiler checks every access. `@concurrent` (Swift 6.2+) marks the function that should run on the concurrent thread pool ([Swift 6.2 release post](https://www.swift.org/blog/swift-6.2-released/)). New app projects since Xcode 26 make the main actor the default isolation for the whole module, so the `@MainActor` annotation is already implied there ([WWDC25: Elevate an app with Swift concurrency](https://developer.apple.com/videos/play/wwdc2025/270/)). In that mode, mark model types used off the main actor, such as `Product`, as `nonisolated`.
+</TabItem>
+<TabItem label="React Native">
+```tsx
+function useProducts() {
+  const [items, setItems] = useState<Product[]>([]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    (async () => {
+      // The JS thread is free while the request is in flight.
+      const res = await fetch(url, { signal: controller.signal });
+      // Parsing the body runs on the JS thread.
+      setItems(await res.json());
+    })().catch(() => {});
+    return () => controller.abort(); // cancel on unmount
+  }, []);
+
+  return items;
+}
+```
+JavaScript has one thread per runtime. `await` frees it while the request is in flight, but parsing a large body runs on it and holds up every other handler. To move CPU work off the JS thread, write a native module, or run JavaScript on another thread with `react-native-worklets`, the library under Reanimated 4:
+
+```tsx
+import {
+  createWorkletRuntime,
+  scheduleOnRuntime,
+  scheduleOnRN,
+} from 'react-native-worklets';
+
+const parser = createWorkletRuntime({ name: 'parser' });
+
+function parseInBackground(
+  body: string,
+  onDone: (items: Product[]) => void,
+) {
+  scheduleOnRuntime(parser, (text: string) => {
+    const items = JSON.parse(text);   // parser thread
+    scheduleOnRN(onDone, items);      // back on the JS thread
+  }, body);
+}
+```
+API names are from react-native-worklets 0.13 ([scheduleOnRuntime](https://docs.swmansion.com/react-native-worklets/docs/threading/scheduleOnRuntime/), [scheduleOnRN](https://docs.swmansion.com/react-native-worklets/docs/threading/scheduleOnRN/)).
+</TabItem>
+<TabItem label="Flutter">
+```dart
+class SearchModel extends ChangeNotifier {
+  List<Product> items = [];
+  bool _disposed = false;
+
+  Future<void> load() async {
+    final res = await http.get(url); // event loop is free while waiting
+    final body = res.body;
+    // CPU work on another isolate.
+    final parsed = await Isolate.run(() => parseProducts(body));
+    if (_disposed) return; // screen closed meanwhile
+    items = parsed;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+}
+```
+Dart code runs in isolates. Each has its own memory and one thread running an event loop, and isolates communicate only by messages ([Dart concurrency](https://dart.dev/language/concurrency)). `Isolate.run` spawns one, runs the function and transfers the result back without copying it ([Dart isolates](https://dart.dev/language/isolates)). Flutter's `compute()` does the same job. The Flutter docs set the threshold at work that cannot finish between two frames ([Concurrency and isolates](https://docs.flutter.dev/perf/isolates)). A `Future` has no cancel method, so the code checks a flag after each `await`.
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: coroutines work the same on every target.
+class ProductRepository(private val api: Api) {
+    suspend fun products(): List<Product> = withContext(Dispatchers.Default) {
+        parseProducts(api.fetchProducts())
+    }
+}
+```
+```swift
+// iosApp, with Swift export: a suspend function arrives as async.
+let products = try await repository.products()
+```
+kotlinx.coroutines (1.11) is multiplatform. On iOS, `Dispatchers.Main` is backed by the main dispatch queue, and `Default` and `IO` are thread pools as on the JVM ([Dispatchers.Main](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-dispatchers/-main.html)). The boundary with Swift is the hard part. Through the Objective-C export, a `suspend` function becomes a completion handler. Swift can call it with `await`, which the Kotlin docs describe as highly experimental ([interop docs](https://kotlinlang.org/docs/native-objc-interop.html)). Cancelling the Swift task does not cancel the coroutine, and a `Flow` cannot be iterated with `for await`. [SKIE](https://skie.touchlab.co/features/suspend) and [KMP-NativeCoroutines](https://github.com/rickclephas/KMP-NativeCoroutines) exist to fill those gaps. Swift export, Alpha in Kotlin 2.4, maps `suspend` to `async` and `Flow` to `AsyncSequence` directly ([Kotlin 2.4 notes](https://kotlinlang.org/docs/whatsnew24.html)).
+</TabItem>
+</Tabs>
+
+Answer to the Brain Power question: in Kotlin, JavaScript and Dart the UI freezes. `async` and `suspend` only allow a function to pause, and this one never does. Swift depends on compiler settings. With the defaults of a new Xcode 26+ project, an `async` function runs on its caller's actor, so the loop runs on the main thread and the UI freezes. In Swift 6.0 and 6.1, and in projects that have not adopted the new setting, a nonisolated `async` function switches to the concurrent pool, and the UI stays responsive.
+
+<Aside type="caution" title="Watch it!">
+Enabling Swift 6.2's "Approachable Concurrency" build setting in an existing project changes where code runs. Nonisolated `async` functions that used to hop to a background thread now stay on the caller's actor, which is often the main actor, and the compiler reports no error. Mark the functions that must leave the main thread with `@concurrent` before you turn it on ([Swift 6.2 release post](https://www.swift.org/blog/swift-6.2-released/)).
+</Aside>
+
+## Cancellation and the stale response
+
+The search bug from the opening needs "latest wins": when a new query starts, the previous one is cancelled or its result is ignored.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 5
+grid-columns: 3
+grid-gap: 12
+h0: "Event" { class: head }
+h1: "No cancellation" { class: head }
+h2: "Latest wins" { class: head }
+r1: "User types \"sh\"" { class: box }
+r1a: "request A sent" { class: box }
+r1b: "request A sent" { class: box }
+r2: "User types \"sho\"" { class: box }
+r2a: "request B sent" { class: box }
+r2b: "A cancelled,\nrequest B sent" { class: ok }
+r3: "B returns first" { class: box }
+r3a: "shows \"sho\" results" { class: ok }
+r3b: "shows \"sho\" results" { class: ok }
+r4: "A returns late" { class: box }
+r4a: "overwrites with\n\"sh\" results" { class: bad }
+r4b: "nothing happens" { class: ok }
+```
+
+| Stack | Scope tied to the screen | Latest wins |
+| --- | --- | --- |
+| Android, KMP | `viewModelScope`, `lifecycleScope` | `queries.collectLatest { results = search(it) }` cancels the running block when a new query arrives |
+| iOS | `.task { }` on the view, or a stored `Task` you cancel | `.task(id: query) { }` cancels and restarts when `query` changes |
+| React Native | `useEffect` cleanup | Put `query` in the effect's dependencies and abort the previous `fetch` in the cleanup |
+| Flutter | `State.dispose()`, `StreamSubscription.cancel()` | Keep a request counter and drop responses that are not the latest |
+
+Cancellation is cooperative everywhere. Cancelling sets a flag, and the work stops at its next check. Kotlin checks at every suspension point and throws `CancellationException`. Swift's `URLSession` calls throw when cancelled, and your own loops call `try Task.checkCancellation()`. In JavaScript you pass an `AbortSignal` down to `fetch`. A tight CPU loop that never checks will run to the end in every stack.
+
+<Aside type="caution" title="Watch it!">
+In Kotlin, a `catch (e: Exception)` around a suspending call also catches `CancellationException`. If the block swallows it, the coroutine keeps running after its scope was cancelled. Rethrow it, or catch the specific exceptions you expect ([cancellation docs](https://kotlinlang.org/docs/cancellation-and-timeouts.html)).
+</Aside>
+
+## Shared mutable state
+
+Two threads writing the same object cause crashes that are rare and hard to reproduce. Each stack handles the risk differently.
+
+- **Kotlin** threads share memory, and the compiler does not check access. The conventions do the work: keep UI state on the main dispatcher, expose immutable values through `StateFlow`, and protect anything touched from several dispatchers with a `Mutex` or a single-threaded dispatcher ([shared mutable state](https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html)). Kotlin/Native follows the same rules: objects live in a shared heap and can be used from any thread ([memory manager](https://kotlinlang.org/docs/native-memory-manager.html)).
+- **Swift** checks at compile time. In the Swift 6 language mode, a value that crosses between actors must be `Sendable`, and mutable state must be isolated to an actor. A data race is a build error ([data race safety](https://www.swift.org/migration/documentation/swift-6-concurrency-migration-guide/dataracesafety/)).
+- **JavaScript** has one thread per runtime, so two pieces of code never run at the same instant. Worklet runtimes are separate runtimes on their own threads.
+- **Dart** isolates share no memory, so there is nothing to lock.
+
+A single thread does not remove ordering bugs. The stale search response happened on one thread, between two `await`s. The Dart docs make the same point: isolates prevent data races, and race conditions remain possible.
+
+## Trade-offs and scale
+
+**Make every function safe to call from the UI thread.** Android's guidance is that a suspend function should be main-safe: if it does blocking or heavy work, it moves itself off the main thread with `withContext`, so callers never have to think about threads ([coroutines best practices](https://developer.android.com/kotlin/coroutines/coroutines-best-practices)). The same convention works in every stack. In a large codebase it means reviewing thread safety once, inside the function, instead of at every call site.
+
+**Never block a pool thread.** `Dispatchers.Default` and Swift's concurrent pool have about one thread per core. A semaphore wait or a synchronous file read inside them takes a thread away from everyone else. Swift's runtime is designed around threads that never block ([WWDC21: Swift concurrency, behind the scenes](https://developer.apple.com/videos/play/wwdc2021/10254/)). Kotlin has `Dispatchers.IO` for calls that must block.
+
+**Moving work has a cost.** A thread hop, an isolate spawn or a message between JavaScript runtimes takes time and often copies data. Work that fits in a fraction of a frame is faster inline. `Isolate.run` starts a new isolate per call, which suits an occasional large parse. For frequent jobs, keep a long-lived worker.
+
+**Inject the thread choice.** Hard-coded `Dispatchers.IO` makes tests slow and flaky. Pass dispatchers in, and tests can replace them with a test dispatcher that runs on virtual time (also in the best practices above).
+
+**Catch main-thread work during development.** Android's `StrictMode` reports disk and network access on the main thread ([StrictMode](https://developer.android.com/reference/android/os/StrictMode)). Xcode's Thread Performance Checker flags non-UI work on the main thread ([Apple docs](https://developer.apple.com/documentation/xcode/diagnosing-performance-issues-early)). React Native's performance monitor shows JS and UI frame rates separately, which tells you which thread is the busy one ([RN performance](https://reactnative.dev/docs/performance)).
+
+**Watch it in production.** Android vitals in Play Console reports your ANR rate ([docs](https://developer.android.com/google/play/vitals/anr)). MetricKit delivers hang diagnostics on iOS ([MXHangDiagnostic](https://developer.apple.com/documentation/metrickit/mxhangdiagnostic)). The observability chapter covers both.
+
+<NoDumbQuestions>
+<dt>Is a coroutine a thread?</dt>
+<dd>No. A coroutine is a function that can pause. Thousands of them can share a few threads, because a paused coroutine uses no thread at all. The same is true of a Swift `Task`, a JavaScript promise chain and a Dart `Future`.</dd>
+
+<dt>Does React's concurrent rendering make JavaScript multithreaded?</dt>
+<dd>No. React splits rendering into small pieces on the same JS thread and lets urgent updates interrupt less urgent ones. `startTransition` marks an update as interruptible. A slow component still takes the same total time.</dd>
+
+<dt>Should I put everything on a background thread to be safe?</dt>
+<dd>No. Every hop costs time, UI objects can only be touched on the UI thread anyway, and more threads mean more shared state to protect. Move work that waits or computes for longer than a frame.</dd>
+
+<dt>Do I still need Grand Central Dispatch on iOS?</dt>
+<dd>You need to read it, because older code and many SDKs use `DispatchQueue.main.async`. New code uses Swift Concurrency, where the compiler checks what GCD left to discipline.</dd>
+
+<dt>I found a tutorial using React Native's `InteractionManager`. Is that current?</dt>
+<dd>No. It was deprecated and then removed in React Native 0.87. The release notes point to `requestIdleCallback` instead.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| UI thread | Main thread, `Dispatchers.Main` | Main actor | JS thread and UI thread | Main isolate | Host platform's main thread |
+| Function that can pause | `suspend fun` | `async` function | `async` function | `async` function | `suspend fun` |
+| Handle to running work | `Job`, `Deferred` | `Task` | `Promise` | `Future` | `Job`, `Deferred` |
+| Start from non-async code | `scope.launch { }` | `Task { }` | Call the function | Call the function | `scope.launch { }` |
+| Move CPU work off | `withContext(Dispatchers.Default)` | `@concurrent` function | Worklet runtime, native module | `Isolate.run`, `compute` | `withContext(Dispatchers.Default)` |
+| Blocking calls | `Dispatchers.IO` | Use the async API | Native module | Async `dart:io` APIs | `Dispatchers.IO` |
+| Screen-scoped work | `viewModelScope` | `.task { }` | `useEffect` cleanup | `dispose()` | `viewModelScope` |
+| Cancel | `job.cancel()` | `task.cancel()` | `AbortController` | `subscription.cancel()` | `job.cancel()` |
+| Run in parallel, wait for all | `async` + `awaitAll` | `async let`, `TaskGroup` | `Promise.all` | `Future.wait` | `async` + `awaitAll` |
+| Stream of values | `Flow`, `StateFlow` | `AsyncSequence` | Event subscriptions, stores | `Stream` | `Flow`, `StateFlow` |
+| Data race protection | Conventions, `Mutex` | `Sendable` and actors, checked by the compiler | One thread per runtime | Isolates share nothing | As Android |
+| Penalty for blocking | Jank, then ANR | Hang, then watchdog kill | Host platform's | Host platform's | Host platform's |
+
+In React Native and Flutter, `Promise.all` and `Future.wait` overlap waiting, not computing. Parallel CPU work needs worker runtimes or isolates.
+
+<Exercise>
+For each snippet, name the thread the slow line runs on and say whether the UI stays responsive.
+
+1. Kotlin: `viewModelScope.launch { val bitmap = decodeHugeImage(file) }` where `decodeHugeImage` is a regular function.
+2. Swift, in a project created with Xcode 26 or later: `func resize(_ image: UIImage) async -> UIImage`, called from a view's `.task`.
+3. TypeScript: `const sorted = await Promise.resolve(bigArray.sort(compare));`
+4. Dart: `final hash = await compute(sha256OfFile, path);`
+5. Kotlin: `withContext(Dispatchers.IO) { rows.sortedBy { it.score } }` with a million rows.
+
+<Fragment slot="answer">
+1. The main thread. `viewModelScope` uses the main dispatcher and nothing switches away from it. The UI freezes. Wrap the call in `withContext(Dispatchers.Default)`.
+2. The main thread. New projects default to main actor isolation, and an `async` function stays on its caller's actor. The UI freezes. Mark `resize` with `@concurrent`.
+3. The JS thread. `sort` runs to completion before `Promise.resolve` is even called, so the `await` changes nothing. JavaScript-driven updates freeze.
+4. A background isolate. The UI stays responsive.
+5. An IO pool thread. The UI stays responsive, so it works, but it is the wrong pool: `Dispatchers.IO` is sized for blocking calls, and CPU work belongs on `Dispatchers.Default`, which is limited to the core count.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** uses C# `async`/`await` with `Task`. `Task.Run` moves work to the thread pool, and `MainThread.BeginInvokeOnMainThread` returns to the UI thread.
+- **Ionic / Capacitor** runs JavaScript on the WebView's single thread, with Web Workers for CPU work and native plugins for platform calls.
+- **Lynx** splits JavaScript across two threads by design: a main thread for UI-critical scripts and a background thread for app logic.
+
+## Sources
+
+- Android: [ANRs](https://developer.android.com/topic/performance/issues/anr), [Coroutines best practices](https://developer.android.com/kotlin/coroutines/coroutines-best-practices), [Coroutines with lifecycle-aware components](https://developer.android.com/topic/libraries/architecture/coroutines), [StrictMode](https://developer.android.com/reference/android/os/StrictMode)
+- Kotlin: [kotlinx.coroutines releases](https://github.com/Kotlin/kotlinx.coroutines/releases), [Dispatchers API](https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-dispatchers/), [Shared mutable state and concurrency](https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html), [Kotlin/Native memory manager](https://kotlinlang.org/docs/native-memory-manager.html), [Swift/Objective-C interop](https://kotlinlang.org/docs/native-objc-interop.html), [Swift export](https://kotlinlang.org/docs/native-swift-export.html), [Kotlin 2.4.0](https://kotlinlang.org/docs/whatsnew24.html), [Kotlin 2.0.20: suspend functions on any thread](https://kotlinlang.org/docs/whatsnew2020.html)
+- iOS: [Swift 6.2 released](https://www.swift.org/blog/swift-6.2-released/), [Swift 6.4 released](https://www.swift.org/blog/swift-6.4-released/), [Data race safety](https://www.swift.org/migration/documentation/swift-6-concurrency-migration-guide/dataracesafety/), [WWDC25: Embracing Swift concurrency](https://developer.apple.com/videos/play/wwdc2025/268/), [WWDC25: Elevate an app with Swift concurrency](https://developer.apple.com/videos/play/wwdc2025/270/), [WWDC21: Swift concurrency, behind the scenes](https://developer.apple.com/videos/play/wwdc2021/10254/), [WWDC22: Track down hangs](https://developer.apple.com/videos/play/wwdc2022/10082/), [Addressing watchdog terminations](https://developer.apple.com/documentation/xcode/addressing-watchdog-terminations)
+- React Native: [Threading model](https://reactnative.dev/architecture/threading-model), [Performance](https://reactnative.dev/docs/performance), [0.87 release notes](https://reactnative.dev/blog/2026/08/11/react-native-0.87), [The New Architecture is here](https://reactnative.dev/blog/2024/10/23/the-new-architecture-is-here), [React: startTransition](https://react.dev/reference/react/startTransition), [react-native-worklets](https://docs.swmansion.com/react-native-worklets/), [Reanimated 4 migration](https://docs.swmansion.com/react-native-reanimated/docs/guides/migration-from-3.x/)
+- Flutter: [Concurrency and isolates](https://docs.flutter.dev/perf/isolates), [Dart concurrency](https://dart.dev/language/concurrency), [Dart isolates](https://dart.dev/language/isolates), [Isolate.run](https://api.dart.dev/dart-isolate/Isolate/run.html), [Parse JSON in the background](https://docs.flutter.dev/cookbook/networking/background-parsing)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 6 (app crashes) and ch. 32 (performance)

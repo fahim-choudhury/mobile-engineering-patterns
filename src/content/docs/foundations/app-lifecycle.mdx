@@ -1,0 +1,422 @@
+---
+title: App lifecycle and process death
+description: A backgrounded app can be killed without warning. This chapter covers the lifecycle states every stack shares, which state survives a kill, and how to put the user back on the screen they left.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import BrainPower from '../../../components/BrainPower.astro';
+import NoDumbQuestions from '../../../components/NoDumbQuestions.astro';
+import Exercise from '../../../components/Exercise.astro';
+
+A user is halfway through an insurance claim in your app. Step 3 asks for the policy number, so they switch to their email app, find it, copy it and switch back. Your app shows its splash screen, then step 1, with every field empty.
+
+Nothing crashed. There is no stack trace and no error in your logs. While the user was reading email, the OS needed memory, killed your process and kept only a screenshot in the app switcher. Tapping that screenshot started a new process, and your code had no idea a claim was in progress.
+
+<BrainPower>
+A user leaves your app on a detail screen, three levels deep, with half a comment typed. Ten minutes later the OS kills the process. The user taps your app in the app switcher. In the stack you know best, with no extra code, do they see the comment, the detail screen without the comment, or the home screen? The answer is at the end of the "Saving a draft in each stack" section.
+</BrainPower>
+
+## The OS owns your process
+
+On a desktop, a program runs until the user quits it. On a phone, the OS decides. Memory is small, there is no large swap file to hide behind, and the foreground app must stay fast. So both platforms treat backgrounded apps as a cache: they stay in memory to make switching back instant, and they are evicted when something else needs the space.
+
+- **Android** ranks processes by importance: foreground, visible, service, cached. A cached process holds an app the user has left, and the low memory killer removes cached processes first ([Processes and app lifecycle](https://developer.android.com/guide/components/activities/process-lifecycle)). Android 17 also enforces per-app memory limits based on the device's RAM ([behavior changes](https://developer.android.com/about/versions/17/behavior-changes-all)).
+- **iOS** moves a backgrounded app to the suspended state shortly after it leaves the screen. A suspended app is in memory but runs no code. When memory runs low, the system (the mechanism is called jetsam) terminates suspended apps, and it can terminate a foreground app that exceeds its memory limit ([jetsam event reports](https://developer.apple.com/documentation/xcode/identifying-high-memory-use-with-jetsam-event-reports)).
+
+Neither platform runs your code at the moment of the kill. A suspended or cached process is not executing, so there is no callback to save anything. The last code you can count on runs when the app leaves the foreground.
+
+```d2
+classes: {
+  run: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  warn: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  idle: { style: { fill: "#E8E8E8"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+}
+grid-rows: 2
+grid-columns: 3
+horizontal-gap: 70
+vertical-gap: 70
+none: "Not running" { class: idle }
+active: "Active\non screen,\nreceives input" { class: run }
+inactive: "Inactive\non screen,\nno input" { class: run }
+killed: "Killed by the OS\nno callback" { class: bad }
+susp: "Suspended / cached\nin memory,\nno CPU time" { class: warn }
+bg: "Background\noff screen, code\nruns for seconds" { class: warn }
+none -> active
+active <-> inactive
+inactive <-> bg
+bg <-> susp
+susp -> killed
+killed -> none
+```
+
+Read it clockwise from the top left, starting with a launch. Green states are visible to the user. A phone call, the app switcher or a system dialog moves the app between active and inactive. Pressing Home or opening another app sends it to the background, and seconds later it is suspended. From there the user can return, or the OS can kill the process to free memory. Once the app is in the background, every later step can happen without your code running again.
+
+## The same states under different names
+
+| State | Android `Activity` | iOS scene | React Native `AppState` | Flutter `AppLifecycleState` |
+| --- | --- | --- | --- | --- |
+| On screen, receiving input | Resumed | Foreground active | `active` | `resumed` |
+| On screen, no input | Paused (after `onPause`) | Foreground inactive | `inactive` on iOS, `background` on Android | `inactive` |
+| Off screen | Stopped (after `onStop`) | Background, then suspended | `background` | `hidden`, then `paused` |
+| Process killed | No callback | No callback | No callback | No callback |
+
+Compose Multiplatform exposes the Android names on every platform through a common `Lifecycle`. On iOS it maps `willResignActive` to `ON_PAUSE`, `didEnterBackground` to `ON_STOP`, `willEnterForeground` to `ON_START` and `didBecomeActive` to `ON_RESUME` ([CMP lifecycle docs](https://kotlinlang.org/docs/multiplatform/compose-lifecycle.html)).
+
+## Sort state by how long it must live
+
+The stack-neutral pattern starts with a question about each piece of state on a screen: if the process died right now, what should the user find when they come back?
+
+| Kind of state | Examples | Keep it in | After a kill |
+| --- | --- | --- | --- |
+| App data | Cart contents, sent messages, settings | Disk or server, written when it changes | Still there |
+| UI state worth restoring | Navigation stack, selected tab, scroll position, draft text | The platform's saved-state mechanism, or disk | Restored if you saved it |
+| Rebuildable state | Loaded lists, decoded images, animation progress | Memory only | Gone, loaded again |
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  head: { shape: text; style: { font-size: 18; bold: true } }
+}
+grid-rows: 4
+grid-columns: 5
+grid-gap: 12
+h0: "State kept in" { class: head }
+h1: "Rotation\nor resize" { class: head }
+h2: "Backgrounded,\nprocess alive" { class: head }
+h3: "Process killed\nby the OS" { class: head }
+h4: "User swipes\nthe app away" { class: head }
+m0: "Memory" { class: box }
+m1: "Kept*" { class: ok }
+m2: "Kept" { class: ok }
+m3: "Lost" { class: bad }
+m4: "Lost" { class: bad }
+s0: "Saved UI state" { class: box }
+s1: "Kept" { class: ok }
+s2: "Kept" { class: ok }
+s3: "Restored" { class: ok }
+s4: "Discarded" { class: bad }
+d0: "Disk or server" { class: box }
+d1: "Kept" { class: ok }
+d2: "Kept" { class: ok }
+d3: "Kept" { class: ok }
+d4: "Kept" { class: ok }
+```
+
+\* On Android, memory state survives rotation only when it is held outside the Activity, which is the job of `ViewModel`. See "Configuration changes" below.
+
+The rest of the pattern follows from the table:
+
+1. **Write app data when it changes.** There is no reliable "app is exiting" moment to flush it.
+2. **Save small keys for UI state as the app leaves the foreground.** Save the product ID, not the product. Saved-state storage is small and serialized on the main thread.
+3. **Treat launch as possibly a restore.** A new process checks for saved UI state before showing the default first screen, then reloads data using the saved keys.
+4. **Respect a deliberate close.** When the user swipes the app away, both platforms discard saved UI state, and the next launch starts fresh.
+
+```d2
+classes: {
+  box: { style: { font-size: 16 } }
+  ok: { style: { fill: "#D9F5DD"; font-color: "#1F1F1F"; font-size: 16 } }
+  warn: { style: { fill: "#FFF4C2"; font-color: "#1F1F1F"; font-size: 16 } }
+  bad: { style: { fill: "#FFD9D9"; font-color: "#1F1F1F"; font-size: 16 } }
+  group: { style: { font-size: 18 } }
+}
+direction: down
+grid-columns: 2
+grid-gap: 40
+out: "Leaving" {
+  class: group
+  a: "User switches\nto another app" { class: box }
+  b: "Save small keys:\nroute, IDs, draft" { class: warn }
+  c: "OS kills\nthe process" { class: bad }
+  a -> b -> c
+}
+back: "Returning" {
+  class: group
+  d: "User taps the app:\nnew process starts" { class: box }
+  e: "Saved UI state\nfound?" { class: warn; shape: diamond }
+  f: "Rebuild screens,\nreload data by ID" { class: ok }
+  g: "Default\nfirst screen" { class: box }
+  d -> e
+  e -> f: "yes" { style.font-size: 14 }
+  e -> g: "no" { style.font-size: 14 }
+}
+```
+
+## Reacting to lifecycle changes
+
+A video screen should pause playback when the app is no longer in front, and resume when it returns.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Composable
+fun PlayerScreen(player: Player) {
+    LifecycleStartEffect(player) {
+        player.play()                       // on ON_START
+        onStopOrDispose { player.pause() }  // on ON_STOP or disposal
+    }
+}
+```
+`LifecycleStartEffect` (Lifecycle 2.7+) pairs the started and stopped events. Under it sit the `Activity` callbacks: `onCreate`, `onStart`, `onResume`, `onPause`, `onStop`, `onDestroy` ([Activity lifecycle](https://developer.android.com/guide/components/activities/activity-lifecycle)). `onDestroy` does not run when the process is killed. For whole-app foreground and background events, observe `ProcessLifecycleOwner`.
+</TabItem>
+<TabItem label="iOS">
+```swift
+struct PlayerScreen: View {
+    @Environment(\.scenePhase) private var scenePhase
+    let player: Player
+
+    var body: some View {
+        VideoView(player: player)
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { player.play() } else { player.pause() }
+            }
+    }
+}
+```
+`scenePhase` is `.active`, `.inactive` or `.background` ([ScenePhase](https://developer.apple.com/documentation/swiftui/scenephase)). In UIKit the same events arrive at your `UISceneDelegate` as `sceneWillResignActive` and `sceneDidEnterBackground` ([Managing your app's life cycle](https://developer.apple.com/documentation/uikit/managing-your-app-s-life-cycle)). After entering the background you get about five seconds. For work that needs longer, such as finishing an upload, wrap it in `beginBackgroundTask` ([Apple docs](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+function PlayerScreen({ player }: { player: Player }) {
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') player.play();
+      else player.pause();
+    });
+    return () => sub.remove();
+  }, [player]);
+
+  return <VideoView player={player} />;
+}
+```
+`AppState` reports `active`, `background` and, on iOS only, `inactive` ([AppState docs](https://reactnative.dev/docs/appstate)). On Android it reports `background` as soon as another Activity covers yours, including system ones such as an autofill picker. The events come from the native shell, so your handler runs only while the OS still gives the process CPU time.
+</TabItem>
+<TabItem label="Flutter">
+```dart
+class _PlayerScreenState extends State<PlayerScreen> {
+  late final AppLifecycleListener _listener;
+
+  @override
+  void initState() {
+    super.initState();
+    _listener = AppLifecycleListener(
+      onResume: widget.player.play,
+      onInactive: widget.player.pause,
+    );
+  }
+
+  @override
+  void dispose() {
+    _listener.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => VideoView(player: widget.player);
+}
+```
+`AppLifecycleListener` (Flutter 3.13+) has a callback per transition: `onInactive`, `onHide`, `onPause`, `onRestart`, `onShow`, `onResume` ([API docs](https://api.flutter.dev/flutter/widgets/AppLifecycleListener-class.html)). Flutter's names do not match Android's: `Activity.onPause` produces `inactive`, and `Activity.onStop` produces `paused` ([AppLifecycleState](https://api.flutter.dev/flutter/dart-ui/AppLifecycleState.html)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: the Android code, unchanged.
+@Composable
+fun PlayerScreen(player: Player) {
+    LifecycleStartEffect(player) {
+        player.play()
+        onStopOrDispose { player.pause() }
+    }
+}
+```
+`lifecycle-runtime-compose` has been multiplatform since Lifecycle 2.8, so the effect APIs compile in common code. On iOS the events are driven by the UIKit notifications listed in the table above. With KMP and native UI, shared code has no lifecycle of its own: SwiftUI observes `scenePhase` and calls into Kotlin.
+</TabItem>
+</Tabs>
+
+## Saving a draft in each stack
+
+A comment box whose text should survive a process kill.
+
+<Tabs syncKey="stack">
+<TabItem label="Android">
+```kotlin
+@Composable
+fun CommentBox() {
+    var draft by rememberSaveable { mutableStateOf("") }
+    TextField(value = draft, onValueChange = { draft = it })
+}
+
+// When logic needs the value, hold it in the ViewModel instead.
+class CommentViewModel(private val handle: SavedStateHandle) : ViewModel() {
+    val draft = handle.getStateFlow("draft", "")
+    fun onDraftChange(text: String) { handle["draft"] = text }
+}
+```
+Each holder lives a different length of time. `remember` is lost on rotation. A `ViewModel` survives rotation and dies with the process. `rememberSaveable` and `SavedStateHandle` write into the Activity's saved instance state, which the system keeps after it kills the process and hands back when the user returns ([Save UI states](https://developer.android.com/topic/libraries/architecture/saving-states)). For `@Serializable` classes there is `rememberSerializable`, and `SavedStateHandle.saved { }` since Lifecycle 2.9. Jetpack Navigation saves its back stack the same way.
+</TabItem>
+<TabItem label="iOS">
+```swift
+struct CommentBox: View {
+    @SceneStorage("comment.draft") private var draft = ""
+
+    var body: some View {
+        TextField("Add a comment", text: $draft)
+    }
+}
+```
+`@State` lives as long as the process. `@SceneStorage` has the same shape, and the system saves and restores it per scene ([SceneStorage](https://developer.apple.com/documentation/swiftui/scenestorage)). Keep the values lightweight. For navigation, `NavigationPath` offers a `codable` representation you can store and reload ([NavigationPath](https://developer.apple.com/documentation/swiftui/navigationpath)). UIKit apps return an `NSUserActivity` from `stateRestorationActivity(for:)` in the scene delegate ([Restoring your app's state](https://developer.apple.com/documentation/uikit/restoring-your-app-s-state)).
+</TabItem>
+<TabItem label="React Native">
+```tsx
+import { useMMKVString } from 'react-native-mmkv';
+
+function CommentBox() {
+  const [draft, setDraft] = useMMKVString('comment.draft');
+  return <TextInput value={draft ?? ''} onChangeText={setDraft} />;
+}
+```
+React Native does not expose the platform's saved-state mechanism to JavaScript. When the process dies the JavaScript heap goes with it, and the next launch renders the root component from scratch. Restoring means persisting to disk yourself. [MMKV](https://github.com/mrousavy/react-native-mmkv) (V4 shown here) reads synchronously, so the first render already has the draft. Navigation state is persisted the same way: React Navigation 7 takes `initialState` and `onStateChange` props ([state persistence](https://reactnavigation.org/docs/state-persistence/)), and React Navigation 8, in pre-release as of its July 2026 progress report, replaces them with a `persistor` prop ([upgrade guide](https://reactnavigation.org/docs/8.x/upgrading-from-7.x/)).
+</TabItem>
+<TabItem label="Flutter">
+```dart
+// Turn restoration on for the app.
+MaterialApp(
+  restorationScopeId: 'app',
+  home: const CommentScreen(),
+);
+
+// Built-in widgets restore themselves when given an ID.
+const TextField(restorationId: 'comment_draft');
+
+// Custom state: Restorable properties registered through RestorationMixin.
+class _CounterState extends State<Counter> with RestorationMixin {
+  final _count = RestorableInt(0);
+
+  @override
+  String? get restorationId => 'counter';
+
+  @override
+  void restoreState(RestorationBucket? oldBucket, bool initialRestore) {
+    registerForRestoration(_count, 'count');
+  }
+  // build() reads _count.value
+}
+```
+Restoration is off until you set `restorationScopeId`. The framework sends restoration data to the engine as state changes, because the OS gives no time to collect it at kill time. On Android the data travels in the saved instance state ([Restore state on Android](https://docs.flutter.dev/platform-integration/android/restore-state-android)). iOS needs extra setup in Xcode ([Restore state on iOS](https://docs.flutter.dev/platform-integration/ios/restore-state-ios)).
+</TabItem>
+<TabItem label="KMP / CMP">
+```kotlin
+// commonMain: same API as Android.
+@Composable
+fun CommentBox() {
+    var draft by rememberSaveable { mutableStateOf("") }
+    TextField(value = draft, onValueChange = { draft = it })
+}
+```
+`SavedStateHandle` is multiplatform since Lifecycle 2.9, and `ViewModel` works in common code as long as you pass a factory, because non-JVM targets cannot create one by reflection ([CMP ViewModel docs](https://kotlinlang.org/docs/multiplatform/compose-viewmodel.html)). On Android these values ride in the Activity's saved state as usual. For iOS, the CMP lifecycle docs describe event mapping only, with no hookup to UIKit state restoration, so write drafts to disk there. DataStore Preferences supports KMP ([docs](https://developer.android.com/kotlin/multiplatform/datastore)). With KMP and native UI, the SwiftUI side uses `@SceneStorage` as in the iOS tab.
+</TabItem>
+</Tabs>
+
+Answer to the Brain Power question: only native Android brings back the detail screen without extra code, because Jetpack Navigation saves its back stack. The comment returns too if the field uses `rememberSaveable`. SwiftUI, React Native and Flutter all show the home screen until you opt in with `@SceneStorage`, persisted navigation state or `restorationScopeId`.
+
+<Aside type="caution" title="Watch it!">
+Saved state is for keys and short strings. Android's saved instance state travels through Binder, whose transaction buffer is 1 MB shared across the whole process. Exceed it and the app crashes with `TransactionTooLargeException`. Google recommends staying under 50 KB ([Parcelables and bundles](https://developer.android.com/guide/components/activities/parcelables-and-bundles)). Flutter's restoration data on Android has the same ceiling. Apple also warns against putting sensitive data in `SceneStorage`.
+</Aside>
+
+## Configuration changes
+
+Android has a second kind of teardown that the other platforms lack. When the configuration changes (rotation, window resize, dark mode, locale, font scale), the system destroys the `Activity` and creates a new one with the new resources. The process stays alive. `ViewModel` exists to carry state across that gap, and it is why the "Memory" row in the diagram above has an asterisk ([Handle configuration changes](https://developer.android.com/guide/topics/resources/runtime-changes)).
+
+Recent Android releases changed when it happens:
+
+- Apps that target Android 16 (API 36) have their orientation and resizability restrictions ignored on displays 600dp and wider, with a temporary opt-out. Targeting Android 17 (API 37) removes the opt-out ([Android 17 changes](https://developer.android.com/about/versions/17/changes/ff-restrictions-ignored)). A phone-only app locked to portrait will be rotated and resized on tablets and foldables.
+- Android 17 stops recreating activities for keyboard, navigation, touchscreen and colour mode changes. The activity receives `onConfigurationChanged` instead ([runtime changes](https://developer.android.com/guide/topics/resources/runtime-changes)).
+
+React Native and Flutter sidestep recreation. Their template manifests declare `android:configChanges` for orientation, screen size, UI mode and more, so the single host `Activity` stays alive and the framework re-lays out for the new size. JavaScript and Dart state survive rotation with no work from you.
+
+iOS has no equivalent. Rotation and size changes update the trait environment, and your views and their state stay alive.
+
+<Aside type="caution" title="Watch it!">
+A React Native app still meets Activity recreation. After a process kill, Android rebuilds the host `Activity` from its saved instance state and tries to restore the fragments that `react-native-screens` created. The app then crashes with "Screen fragments should never be restored". The library's README has the fix: set `RNScreensFragmentFactory` on the fragment manager in `MainActivity.onCreate` ([react-native-screens](https://github.com/software-mansion/react-native-screens#android)).
+</Aside>
+
+## Trade-offs and scale
+
+**Restore keys, then reload.** A restored screen gets its ID from saved state and its content from the database or network. That keeps saved state small, and it means a restore shows current data instead of a stale copy.
+
+**Saved state outlives the code that wrote it.** State you persist to disk can be read by the next app version after an update. React Navigation's docs put a version in the storage key (`NAVIGATION_STATE_V1`) for this reason. Treat any restored blob as untrusted input: if it fails to parse, fall back to the default screen.
+
+**Deep links compete with restoration.** If the app is launched by a link, the link should win. React Navigation's persistence example checks `Linking.getInitialURL()` and skips restoring when a URL is present.
+
+**Some screens should not come back.** A payment confirmation or a one-time code screen restored a day later does more harm than starting over. Decide per flow, and expire saved drafts.
+
+**Test the kill.** Rotating the device or enabling "Don't keep activities" tests Activity recreation, which is not the same thing: the process and every singleton in it stay alive. To test a real kill on Android, press Home, then run `adb shell am kill <package>`, which only kills processes that are safe to kill, the same condition the system applies ([adb docs](https://developer.android.com/tools/adb)). On iOS, send the app to the background and stop it from Xcode. Swiping it away in the app switcher tests the wrong path, because that discards saved state. In automated tests, Compose has `StateRestorationTester` and Flutter has `WidgetTester.restartAndRestore()`.
+
+**Measure it in production.** On Android 11+, `ActivityManager.getHistoricalProcessExitReasons()` returns an `ApplicationExitInfo` for recent process deaths, including `REASON_LOW_MEMORY` ([API reference](https://developer.android.com/reference/android/app/ApplicationExitInfo)). On iOS, MetricKit's `MXAppExitMetric` counts foreground and background exits by cause, including memory limit terminations ([MXBackgroundExitData](https://developer.apple.com/documentation/metrickit/mxbackgroundexitdata)). A rising background kill rate usually means the app holds too much memory when it leaves the foreground.
+
+**Make it part of the screen contract.** In a large app, restoration breaks one screen at a time as teams add state. Require navigation arguments to be small and serializable, and run a restore test for each new screen in CI.
+
+<NoDumbQuestions>
+<dt>Couldn't the OS call my code right before it kills the process?</dt>
+<dd>The process is suspended to save memory and battery. Waking every cached app to let it run cleanup code would use the resources the system is trying to free, at the moment it has the least to spare.</dd>
+
+<dt>Is swiping the app away the same as process death?</dt>
+<dd>No. The system treats it as the user saying "I'm done". Saved UI state is thrown away and the next launch is a fresh start. Data on disk stays.</dd>
+
+<dt>Does a `ViewModel` survive process death?</dt>
+<dd>No. It survives configuration changes because it lives in memory outside the Activity. To survive a kill, the values must go through `SavedStateHandle` or to disk.</dd>
+
+<dt>If I write every keystroke to disk, do I still need saved state?</dt>
+<dd>Disk works, and it is the only option in React Native. The difference is cleanup: the OS scopes saved state to the task or scene and discards it when the user closes the app, while anything on disk stays until your code deletes it.</dd>
+
+<dt>Can iOS kill my app while it is on screen?</dt>
+<dd>Yes, if it exceeds its memory limit. The user sees the app vanish, and you get a jetsam event report instead of a crash report.</dd>
+</NoDumbQuestions>
+
+## Translation table
+
+| Concept | Android | iOS | React Native | Flutter | KMP / CMP |
+| --- | --- | --- | --- | --- | --- |
+| Lifecycle owner | `Activity`, `ProcessLifecycleOwner` | `UIScene`, `scenePhase` | `AppState` | `AppLifecycleListener` | Common `LifecycleOwner` |
+| Leaving the foreground | `onPause` | `sceneWillResignActive`, `.inactive` | `inactive` (iOS), `background` (Android) | `inactive` | `ON_PAUSE` |
+| Off screen | `onStop` | `sceneDidEnterBackground`, `.background` | `background` | `paused` | `ON_STOP` |
+| In-memory screen state | `ViewModel` | `@State`, `@Observable` model | Component state, store | `State`, state package | Common `ViewModel` |
+| Saved UI state | `rememberSaveable`, `SavedStateHandle` | `@SceneStorage`, `NSUserActivity` | None built in: MMKV, AsyncStorage | `RestorationMixin`, `restorationId` | `rememberSaveable` (Android), disk (iOS) |
+| Navigation restore | Jetpack Navigation, automatic | Store `NavigationPath.codable` | React Navigation state persistence | Restorable routes, `restorationScopeId` | Per platform |
+| Extra time after backgrounding | Foreground service, WorkManager | `beginBackgroundTask` | Native modules for the same APIs | Plugins for the same APIs | `expect`/`actual` |
+| Config change teardown | Activity recreated | None | Avoided by `configChanges` | Avoided by `configChanges` | As Android |
+| Simulate a kill | `adb shell am kill` | Background, then stop in Xcode | Same as host platform | Same as host platform | Same as host platform |
+| Exit reasons | `ApplicationExitInfo` | `MXAppExitMetric` | Native APIs | Native APIs | Native APIs |
+
+<Exercise>
+A fintech app asks new users to photograph their ID. The app opens the system camera, the user takes the picture, and the app should continue to the "review your photo" step. Support tickets from users with low-memory Android phones say the app "restarts" after the photo and asks them to begin again.
+
+1. Explain the bug in one or two sentences.
+2. List the pieces of state the flow needs after the camera returns, and say where each should be kept.
+3. Describe how to reproduce it on a developer's high-end phone.
+
+<Fragment slot="answer">
+1. The camera app is memory-hungry, so the system kills your cached process while the user takes the photo. The result is delivered to a new process that kept nothing about the flow in progress.
+2. The current step and the form fields entered so far: saved UI state (`rememberSaveable`, `SavedStateHandle`) or a draft on disk. The photo: a file, with only its path or URI in saved state. Anything already uploaded: on the server, referenced by an ID in saved state. The image bytes must never go into saved state.
+3. Start the flow, open the camera, then run `adb shell am kill <package>` from a terminal while the camera is in front. Take the photo and return. "Don't keep activities" is a weaker test, because the process and its singletons stay alive.
+</Fragment>
+</Exercise>
+
+## Sidebar: other stacks
+
+- **.NET MAUI** raises cross-platform lifecycle events on its `Window` class (`Created`, `Activated`, `Deactivated`, `Stopped`, `Resumed`, `Destroying`) and maps them to the platform callbacks.
+- **Ionic / Capacitor** apps listen to the `App` plugin's `appStateChange` event. The web view's JavaScript state is lost with the process, as in React Native, so drafts go to storage.
+
+## Sources
+
+- Android: [Activity lifecycle](https://developer.android.com/guide/components/activities/activity-lifecycle), [Processes and app lifecycle](https://developer.android.com/guide/components/activities/process-lifecycle), [Save UI states](https://developer.android.com/topic/libraries/architecture/saving-states), [Handle configuration changes](https://developer.android.com/guide/topics/resources/runtime-changes), [Parcelables and bundles](https://developer.android.com/guide/components/activities/parcelables-and-bundles), [ApplicationExitInfo](https://developer.android.com/reference/android/app/ApplicationExitInfo)
+- Android 17: [Orientation and resizability restrictions](https://developer.android.com/about/versions/17/changes/ff-restrictions-ignored), [Behavior changes for all apps](https://developer.android.com/about/versions/17/behavior-changes-all), [Lifecycle release notes](https://developer.android.com/jetpack/androidx/releases/lifecycle)
+- iOS: [Managing your app's life cycle](https://developer.apple.com/documentation/uikit/managing-your-app-s-life-cycle), [ScenePhase](https://developer.apple.com/documentation/swiftui/scenephase), [SceneStorage](https://developer.apple.com/documentation/swiftui/scenestorage), [Restoring your app's state with SwiftUI](https://developer.apple.com/documentation/swiftui/restoring-your-app-s-state-with-swiftui), [Extending your app's background execution time](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time), [Jetsam event reports](https://developer.apple.com/documentation/xcode/identifying-high-memory-use-with-jetsam-event-reports), [MetricKit app exit metrics](https://developer.apple.com/documentation/metrickit/mxappexitmetric)
+- React Native: [AppState](https://reactnative.dev/docs/appstate), [React Navigation state persistence](https://reactnavigation.org/docs/state-persistence/), [react-native-screens Android setup](https://github.com/software-mansion/react-native-screens#android), [react-native-mmkv](https://github.com/mrousavy/react-native-mmkv)
+- Flutter: [AppLifecycleListener](https://api.flutter.dev/flutter/widgets/AppLifecycleListener-class.html), [AppLifecycleState](https://api.flutter.dev/flutter/dart-ui/AppLifecycleState.html), [Restore state on Android](https://docs.flutter.dev/platform-integration/android/restore-state-android), [Restore state on iOS](https://docs.flutter.dev/platform-integration/ios/restore-state-ios), [RestorationMixin](https://api.flutter.dev/flutter/widgets/RestorationMixin-mixin.html)
+- Kotlin: [CMP lifecycle](https://kotlinlang.org/docs/multiplatform/compose-lifecycle.html), [Multiplatform ViewModel](https://kotlinlang.org/docs/multiplatform/compose-viewmodel.html), [DataStore for KMP](https://developer.android.com/kotlin/multiplatform/datastore)
+- Other stacks: [.NET MAUI app lifecycle](https://learn.microsoft.com/en-us/dotnet/maui/fundamentals/app-lifecycle), [Capacitor App plugin](https://capacitorjs.com/docs/apis/app)
+- Background: Gergely Orosz, *Building Mobile Apps at Scale*, ch. 1 (state management)
