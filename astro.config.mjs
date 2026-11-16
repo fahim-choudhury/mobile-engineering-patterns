@@ -24,7 +24,14 @@ export default defineConfig({
 			customCss: ['./src/styles/custom.css'],
 			sidebar: [
 				{ label: 'Start here', items: [{ autogenerate: { directory: 'start-here' } }] },
+				{ label: 'Toolkits', items: [{ autogenerate: { directory: 'toolkits' } }] },
 				{ label: 'Level 0: Foundations', items: [{ autogenerate: { directory: 'foundations' } }] },
+				{ label: 'Level 1: Core app patterns', items: [{ autogenerate: { directory: 'core-patterns' } }] },
+				{ label: 'Level 2: Shipping and operating', items: [{ autogenerate: { directory: 'shipping' } }] },
+				{
+					label: 'Level 3: Architecture at scale and cross-platform',
+					items: [{ autogenerate: { directory: 'architecture' } }],
+				},
 			],
 		}),
 	],
