@@ -2,8 +2,17 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import d2 from 'astro-d2';
+import { satteri } from '@astrojs/markdown-satteri';
+import baseLinks from './plugins/base-links.mjs';
+
+// GitHub Pages project site: https://fahim-choudhury.github.io/mobile-engineering-patterns/
+const site = 'https://fahim-choudhury.github.io';
+const base = '/mobile-engineering-patterns';
 
 export default defineConfig({
+	site,
+	base,
+	markdown: { processor: satteri({ hastPlugins: [baseLinks(base)] }) },
 	integrations: [
 		// D2 diagrams are written inline as ```d2 code blocks and rendered at build time.
 		// useD2js runs D2 through WebAssembly, so no d2 binary is needed.
